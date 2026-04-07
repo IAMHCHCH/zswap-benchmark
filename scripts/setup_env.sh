@@ -28,18 +28,29 @@ echo "  lz4: $(grep -c lz4 /proc/crypto 2>/dev/null || echo 0) instances"
 echo "  lzo: $(grep -c lzo /proc/crypto 2>/dev/null || echo 0) instances"
 echo "  zstd: $(grep -c zstd /proc/crypto 2>/dev/null || echo 0) instances"
 
-echo "[3/5] 安装系统依赖..."
-apt-get update -qq
-apt-get install -y -qq \
-    build-essential \
+echo "[3/5] 安装系统依赖 (yum/dnf)..."
+yum install -y -q \
+    gcc \
+    gcc-c++ \
+    make \
     git \
-    perf-tools-unstable \
+    perf \
     bc \
-    awk \
-    cgroup-tools \
+    gawk \
+    libcgroup \
     stress-ng \
-    linux-tools-common \
-    linux-tools-generic \
+    python3 \
+    python3-matplotlib \
+    || dnf install -y -q \
+    gcc \
+    gcc-c++ \
+    make \
+    git \
+    perf \
+    bc \
+    gawk \
+    libcgroup \
+    stress-ng \
     python3 \
     python3-matplotlib \
     || echo "Some packages may have failed (ok if running in container)"
