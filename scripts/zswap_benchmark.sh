@@ -2,13 +2,14 @@
 #
 # zswap_benchmark.sh - Zswap 性能测试主脚本
 # 对比 lz4/lzo/zstd 在不同线程数下的性能表现
+# 适配 openEuler 24.03 (LTS-SP2) aarch64 环境
 #
 
 set -e
 
 # ========== 配置参数 ==========
 MEM_LIMIT="4G"                      # 内存限制
-THREADS="1 2 4 8 12 16"            # 线程数
+THREADS="1 2 4 8 16 32 64 128"     # 线程数 (适配鲲鹏920 128核)
 ALGOS="lz4 lzo zstd"                # 压缩算法
 MODEL="/tmp/llama.cpp/models/7B/m.gguf"  # 测试模型路径
 PROMPT_LEN=512                       # prompt 长度
@@ -51,17 +52,27 @@ check_dependencies() {
 # 初始化 cgroup
 setup_cgroup() {
     log_info "初始化 cgroup (内存限制: $MEM_LIMIT)..."
-    
+
+    # 检查 memory cgroup 是否可用
+    if [ ! -d /sys/fs/cgroup/memory ]; then
+        log_err "memory cgroup 未挂载，请先运行 setup_env.sh"
+        log_err "或手动挂载: mount -t cgroup -o memory none /sys/fs/cgroup/memory"
+        exit 1
+    fi
+
+    # 创建 cgroup 目录
     sudo mkdir -p /sys/fs/cgroup/memory/zswap_bench
+
+    # 将当前进程加入 cgroup
     echo $$ | sudo tee /sys/fs/cgroup/memory/zswap_bench/tasks > /dev/null
-    
+
     # 设置内存限制
     echo "$MEM_LIMIT" | sudo tee /sys/fs/cgroup/memory/zswap_bench/memory.limit_in_bytes > /dev/null
     echo "$MEM_LIMIT" | sudo tee /sys/fs/cgroup/memory/zswap_bench/memory.soft_limit_in_bytes > /dev/null
-    
+
     # 设置 swappiness (越高越早使用 swap/zswap)
     echo 100 | sudo tee /sys/fs/cgroup/memory/zswap_bench/memory.swappiness > /dev/null
-    
+
     log_info "cgroup 创建完成"
 }
 
@@ -69,28 +80,51 @@ setup_cgroup() {
 configure_zswap() {
     local algo=$1
     log_info "配置 zswap: 算法=$algo"
-    
-    # 启用 zswap 模块
+
+    # 检查 zswap 是否可用
     if [ ! -d /sys/module/zswap ]; then
-        sudo modprobe zswap 2>/dev/null || log_warn "zswap 模块可能已内置"
+        log_err "zswap 模块未加载！"
+        log_err "请确保使用支持 zswap 的内核，并检查:"
+        log_err "  - 内核配置: CONFIG_ZSWAP=y"
+        log_err "  - 当前内核: $(uname -r)"
+        log_err "  - 运行 setup_env.sh 进行环境检查"
+        exit 1
     fi
-    
+
+    # 尝试加载压缩算法模块
+    case $algo in
+        lz4)
+            modprobe lz4 2>/dev/null || true
+            modprobe lz4_compress 2>/dev/null || true
+            ;;
+        lzo)
+            modprobe lzo 2>/dev/null || true
+            ;;
+        zstd)
+            modprobe zstd 2>/dev/null || true
+            ;;
+    esac
+
     # 检查算法是否支持
     if ! grep -q "$algo" /sys/module/zswap/parameters/compressor 2>/dev/null; then
-        local available_algos=$(cat /sys/module/zswap/parameters/enabled 2>/dev/null || echo "unknown")
-        log_warn "算法 $algo 可能不受支持，可用算法请检查内核配置"
+        log_warn "算法 $algo 可能不受支持，尝试继续..."
     fi
-    
+
     # 配置参数
     echo 1 | sudo tee /sys/module/zswap/parameters/enabled > /dev/null
     echo "$algo" | sudo tee /sys/module/zswap/parameters/compressor > /dev/null
     echo 25 | sudo tee /sys/module/zswap/parameters/max_pool_percent > /dev/null
-    
+
     # 清空 pool
     if [ -w /sys/kernel/debug/zswap/flush_pool ]; then
         echo 1 | sudo tee /sys/kernel/debug/zswap/flush_pool > /dev/null
     fi
-    
+
+    # 验证配置
+    local current_algo=$(cat /sys/module/zswap/parameters/compressor)
+    local current_enabled=$(cat /sys/module/zswap/parameters/enabled)
+    log_info "zswap 配置: enabled=$current_enabled, compressor=$current_algo"
+
     sleep 1
 }
 
