@@ -6,9 +6,10 @@ Linux kernel zswap 压缩算法性能对比测试工具，对比 **lz4 / lzo / z
 
 - 支持 lz4、lzo、zstd 三种压缩算法对比
 - 可配置内存限制（cgroup）
-- 线程数 1-16 线性扩展测试
+- 线程数 1-128 线性扩展测试（适配鲲鹏920等多核处理器）
 - LLM 推理场景模拟（基于 llama.cpp）
 - 自动生成性能报告和线性度分析
+- 适配 openEuler 24.03 (LTS-SP2) aarch64 环境
 
 ## 目录结构
 
@@ -17,14 +18,23 @@ zswap-benchmark/
 ├── scripts/
 │   ├── zswap_benchmark.sh      # 主测试脚本
 │   ├── analyze_results.py       # Python 分析脚本
-│   └── setup_env.sh            # 环境初始化
+│   └── setup_env.sh            # 环境初始化（适配 openEuler）
 ├── docs/
-│   └── test_plan.md            # 测试计划文档
+│   ├── test_plan.md            # 测试计划文档
+│   └── environment_a_guide.md  # 环境A操作指导
 ├── results/                    # 测试结果输出目录
 ├── .gitignore
 ├── LICENSE
 └── README.md
 ```
+
+## 环境要求
+
+- **操作系统**: openEuler 24.03 (LTS-SP2) 或其他 Linux 发行版
+- **内核**: 需启用 zswap 支持 (CONFIG_ZSWAP=y)
+- **架构**: aarch64 / x86_64
+- **内存**: 至少 4GB（推荐 16GB+）
+- **权限**: 需要 root 权限运行测试
 
 ## 快速开始
 
@@ -50,14 +60,16 @@ sudo cp llama-bench /usr/local/bin/
 编辑 `scripts/zswap_benchmark.sh` 中的配置：
 
 ```bash
-MEM_LIMIT="4G"          # 内存限制: 2G, 4G, 8G, 16G
-THREADS="1 2 4 8 12 16" # 线程数
-ALGOS="lz4 lzo zstd"   # 压缩算法
+MEM_LIMIT="4G"              # 内存限制: 2G, 4G, 8G, 16G
+THREADS="1 2 4 8 16 32 64 128"  # 线程数（根据CPU核心数调整）
+ALGOS="lz4 lzo zstd"       # 压缩算法
 MODEL="models/qwen-7b.gguf"  # 测试模型路径
 PROMPT_LEN=512
 GEN_LEN=128
 ITERATIONS=3
 ```
+
+> **详细操作指导**: 如果您使用的是 openEuler 或类似环境，请参考 [环境A操作指导](docs/environment_a_guide.md)，包含内核切换、memory cgroup 配置等详细步骤。
 
 ### 3. 运行测试
 
