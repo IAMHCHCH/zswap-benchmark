@@ -269,11 +269,23 @@ else
         LLAMA_CPP_SRC="/tmp/llama.cpp"
     fi
 
-    echo "  编译 llama-bench..."
+    echo "  编译 llama-bench (CMake)..."
     cd "$LLAMA_CPP_SRC"
-    make llama-bench -j$(nproc) 2>&1 | tail -5
 
-    if [ -f llama-bench ]; then
+    # 确保 cmake 可用
+    if ! command -v cmake &> /dev/null; then
+        echo "  安装 cmake..."
+        yum install -y -q cmake || dnf install -y -q cmake
+    fi
+
+    mkdir -p build && cd build
+    cmake .. -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF 2>&1 | tail -5
+    cmake --build . --target llama-bench -j$(nproc) 2>&1 | tail -5
+
+    if [ -f bin/llama-bench ]; then
+        cp bin/llama-bench /usr/local/bin/
+        echo "  ✓ llama-bench 已安装到 /usr/local/bin/"
+    elif [ -f llama-bench ]; then
         cp llama-bench /usr/local/bin/
         echo "  ✓ llama-bench 已安装到 /usr/local/bin/"
     else
