@@ -201,16 +201,17 @@ if $CGROUP_V2_READY; then
     MEM_BEFORE=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null)
     echo "    memory.current (分配前): $MEM_BEFORE bytes ($(( MEM_BEFORE / 1024 / 1024 )) MB)"
 
-    # 用 dd 在 tmpfs 上分配约 128MB，触发 cgroup 内存增长
-    dd if=/dev/zero of=/dev/shm/cgroup_test_$$ bs=1M count=128 2>/dev/null
-    sync
+    # 用 python3 分配 128MB 匿名内存（anonymous memory），必然计入 cgroup memory.current
+    python3 -c "
+import time, mmap
+buf = mmap.mmap(-1, 128 * 1024 * 1024)  # 匿名 mmap，128MB
+buf.write(b'x' * (128 * 1024 * 1024))   # 触发物理页分配
+time.sleep(0.3)
+" 2>/dev/null || echo "    ! python3 执行失败，跳过验证"
 
     # 读取分配后的 memory.current
     MEM_AFTER=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null)
     echo "    memory.current (分配后): $MEM_AFTER bytes ($(( MEM_AFTER / 1024 / 1024 )) MB)"
-
-    # 清理
-    rm -f /dev/shm/cgroup_test_$$
 
     # 将当前 shell 移回根 cgroup
     echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
@@ -278,9 +279,10 @@ else
         yum install -y -q cmake || dnf install -y -q cmake
     fi
 
+    BUILD_LOG="$LLAMA_CPP_SRC/build.log"
     mkdir -p build && cd build
-    cmake .. -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF 2>&1 | tail -5
-    cmake --build . --target llama-bench -j$(nproc) 2>&1 | tail -5
+    cmake .. -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF > "$BUILD_LOG" 2>&1
+    cmake --build . --target llama-bench -j$(nproc) >> "$BUILD_LOG" 2>&1
 
     if [ -f bin/llama-bench ]; then
         cp bin/llama-bench /usr/local/bin/
@@ -289,7 +291,8 @@ else
         cp llama-bench /usr/local/bin/
         echo "  ✓ llama-bench 已安装到 /usr/local/bin/"
     else
-        echo "  ! llama-bench 编译失败，请手动检查"
+        echo "  ! llama-bench 编译失败，构建日志:"
+        tail -20 "$BUILD_LOG"
     fi
 fi
 
