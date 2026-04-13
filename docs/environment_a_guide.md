@@ -20,6 +20,8 @@
 
 **当前使用的内核 (6.19.0-rc7) 未启用 zswap 支持！** 需要切换到标准 openEuler 内核才能进行测试。
 
+**当前系统使用 cgroup v1，需要切换到 cgroup v2。** 通过内核启动参数 `systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all` 启用。
+
 ---
 
 ## 步骤一：切换到支持 zswap 的内核
@@ -90,48 +92,60 @@ ls -la /sys/module/zswap/
 
 ---
 
-## 步骤二：启用 memory cgroup
+## 步骤二：启用 cgroup v2
 
-### 2.1 检查 memory cgroup 状态
-
-```bash
-# 检查 memory cgroup 是否已挂载
-mount | grep cgroup | grep memory
-
-# 检查 memory subsystem 是否启用
-cat /proc/cgroups | grep memory
-```
-
-### 2.2 启用 memory cgroup（如果未启用）
-
-如果 memory cgroup 未挂载，需要启用：
+### 2.1 检查当前 cgroup 版本
 
 ```bash
-# 方法1: 临时挂载
-sudo mkdir -p /sys/fs/cgroup/memory
-sudo mount -t cgroup -o memory none /sys/fs/cgroup/memory
+# 检查当前 cgroup 版本
+# 如果输出包含 "cgroup2 on /sys/fs/cgroup" 则已启用 v2
+mount | grep cgroup
 
-# 验证
-mount | grep cgroup | grep memory
+# 检查 cgroup v2 特征文件是否存在
+ls /sys/fs/cgroup/cgroup.controllers
 ```
 
-如果挂载失败，需要修改内核启动参数：
+### 2.2 通过内核启动参数启用 cgroup v2
+
+如果当前仍使用 cgroup v1，需要在 GRUB 中添加启动参数：
 
 ```bash
 # 编辑 GRUB 配置
 sudo vi /etc/default/grub
 
-# 在 GRUB_CMDLINE_LINUX 中添加以下参数：
-# cgroup_enable=memory swapaccount=1
+# 在 GRUB_CMDLINE_LINUX 中添加以下两个参数：
+#   systemd.unified_cgroup_hierarchy=1  — 启用 cgroup v2 统一层级
+#   cgroup_no_v1=all                    — 禁用所有 cgroup v1 控制器
+#
+# 示例（在原有参数末尾追加）：
+# GRUB_CMDLINE_LINUX="... existing_params ... systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
 
-# 示例：
-# GRUB_CMDLINE_LINUX="... existing params ... cgroup_enable=memory swapaccount=1"
-
-# 更新 GRUB
+# 更新 GRUB 配置
 sudo grub2-mkconfig -o /boot/efi/EFI/openEuler/grub.cfg
 
 # 重启
 sudo reboot
+```
+
+### 2.3 验证 cgroup v2 启用成功
+
+重启后执行：
+
+```bash
+# 应看到 cgroup2 挂载在 /sys/fs/cgroup
+mount | grep cgroup2
+# 输出: cgroup2 on /sys/fs/cgroup type cgroup2 (rw,...)
+
+# 确认 cgroup.controllers 文件存在
+cat /sys/fs/cgroup/cgroup.controllers
+# 应包含: cpuset cpu io memory hugetlb pids ...
+
+# 启用 memory 控制器（如未自动启用）
+echo "+memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+
+# 验证 memory 控制器已启用
+cat /sys/fs/cgroup/cgroup.subtree_control
+# 应包含: memory
 ```
 
 ---
@@ -288,14 +302,18 @@ grep CONFIG_ZSWAP /boot/config-$(uname -r)
 # 如果显示 "# CONFIG_ZSWAP is not set"，需要切换到支持 zswap 的内核
 ```
 
-### Q2: memory cgroup 挂载失败
+### Q2: cgroup v2 未启用
 
 ```bash
 # 检查内核启动参数
 cat /proc/cmdline
 
-# 确保包含: cgroup_enable=memory swapaccount=1
-# 如果没有，需要修改 GRUB 配置并重启
+# 确保包含以下两个参数:
+#   systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all
+#
+# 如果没有，编辑 /etc/default/grub 添加后重新生成 GRUB 配置并重启:
+#   sudo grub2-mkconfig -o /boot/efi/EFI/openEuler/grub.cfg
+#   sudo reboot
 ```
 
 ### Q3: 压缩算法不支持
