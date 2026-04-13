@@ -252,13 +252,25 @@ echo "[6/6] 编译 llama.cpp (可选)..."
 if command -v llama-bench &> /dev/null; then
     echo "  ✓ llama-bench 已安装"
 else
-    echo "  克隆 llama.cpp..."
-    if [ ! -d /tmp/llama.cpp ]; then
+    # 按优先级查找 llama.cpp 源码目录：
+    #   1. 项目相对目录 ../../llama.cpp
+    #   2. /tmp/llama.cpp（之前的默认路径）
+    LLAMA_CPP_SRC=""
+    LOCAL_LLAMA="$(dirname "$0")/../../llama.cpp"
+    if [ -d "$LOCAL_LLAMA" ]; then
+        LLAMA_CPP_SRC="$(cd "$LOCAL_LLAMA" && pwd)"
+        echo "  ✓ 使用本地 llama.cpp: $LLAMA_CPP_SRC"
+    elif [ -d /tmp/llama.cpp ]; then
+        LLAMA_CPP_SRC="/tmp/llama.cpp"
+        echo "  ✓ 使用 /tmp/llama.cpp"
+    else
+        echo "  克隆 llama.cpp..."
         git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+        LLAMA_CPP_SRC="/tmp/llama.cpp"
     fi
 
     echo "  编译 llama-bench..."
-    cd /tmp/llama.cpp
+    cd "$LLAMA_CPP_SRC"
     make llama-bench -j$(nproc) 2>&1 | tail -5
 
     if [ -f llama-bench ]; then
