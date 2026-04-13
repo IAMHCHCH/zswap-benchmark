@@ -95,9 +95,12 @@ echo "[4/6] 配置 cgroup v2..."
 
 # ---- 4.1 检查 cgroup v2 是否已启用 ----
 CGROUP_V2_READY=false
-if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+if stat -f /sys/fs/cgroup 2>/dev/null | grep -q "Type: cgroup2"; then
     CGROUP_V2_READY=true
-    echo "  ✓ cgroup v2 已启用"
+    echo "  ✓ cgroup v2 已启用 (cgroup2 文件系统)"
+elif mount | grep -q "cgroup2 on /sys/fs/cgroup"; then
+    CGROUP_V2_READY=true
+    echo "  ✓ cgroup v2 已启用 (mount 确认)"
 else
     echo "  ! cgroup v2 未启用（当前使用 cgroup v1）"
     echo ""
@@ -124,17 +127,17 @@ if $CGROUP_V2_READY; then
 
     # 在根 cgroup 启用 memory 控制器
     ROOT_SUBTREE="/sys/fs/cgroup/cgroup.subtree_control"
-    if [ -f "$ROOT_SUBTREE" ]; then
-        if ! grep -qw "memory" "$ROOT_SUBTREE" 2>/dev/null; then
-            echo "+memory" > "$ROOT_SUBTREE" 2>/dev/null || {
-                echo "  ! 无法在根 cgroup 启用 memory 控制器"
-                echo "    请检查: cat /sys/fs/cgroup/cgroup.controllers"
-                echo "    如果 memory 不在列表中，说明内核未编译 memory cgroup 支持"
-            }
-        fi
-        if grep -qw "memory" "$ROOT_SUBTREE" 2>/dev/null; then
-            echo "    ✓ memory 控制器已在根 cgroup 中启用"
-        fi
+    if ! grep -qw "memory" "$ROOT_SUBTREE" 2>/dev/null; then
+        echo "+memory" > "$ROOT_SUBTREE" 2>/dev/null || {
+            echo "  ! 无法在根 cgroup 启用 memory 控制器"
+            echo "    请检查: cat /sys/fs/cgroup/cgroup.controllers"
+            echo "    如果 memory 不在列表中，说明内核未编译 memory cgroup 支持"
+        }
+    fi
+    if grep -qw "memory" "$ROOT_SUBTREE" 2>/dev/null; then
+        echo "    ✓ memory 控制器已在根 cgroup 中启用"
+    else
+        echo "    ! memory 控制器未启用"
     fi
 fi
 
