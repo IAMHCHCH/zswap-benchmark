@@ -89,44 +89,96 @@ yum install -y -q \
     python3-matplotlib \
     || echo "Some packages may have failed (ok if running in container)"
 
-# ========== 步骤 4: 配置 memory cgroup ==========
+# ========== 步骤 4: 配置 cgroup v2 ==========
 echo ""
-echo "[4/6] 配置 memory cgroup..."
+echo "[4/6] 配置 cgroup v2..."
 
-# 检查 memory cgroup 是否已挂载
-if mount | grep -q "cgroup.*memory"; then
-    echo "  ✓ memory cgroup 已挂载"
+# ---- 4.1 检查 cgroup v2 是否已启用 ----
+CGROUP_V2_READY=false
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+    CGROUP_V2_READY=true
+    echo "  ✓ cgroup v2 已启用"
 else
-    echo "  ! memory cgroup 未挂载，正在启用..."
+    echo "  ! cgroup v2 未启用（当前使用 cgroup v1）"
+    echo ""
+    echo "  需要通过内核启动参数切换到 cgroup v2:"
+    echo ""
+    echo "  操作步骤:"
+    echo "    1. 编辑 /etc/default/grub"
+    echo "    2. 在 GRUB_CMDLINE_LINUX 中添加:"
+    echo "       systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
+    echo "    3. 生成 GRUB 配置:"
+    echo "       grub2-mkconfig -o /boot/efi/EFI/openEuler/grub.cfg"
+    echo "    4. 重启系统: reboot"
+    echo "    5. 重启后重新运行本脚本"
+    echo ""
+    read -p "  是否继续配置其他依赖？(y/n): " continue_cgroup
+    if [[ ! "$continue_cgroup" =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
 
-    # 检查是否启用了 memory subsystem
-    if ! grep -q "memory" /proc/cgroups; then
-        echo "  ! memory cgroup subsystem 未启用"
-        echo "  需要在内核启动参数中添加: cgroup_enable=memory"
-        echo ""
-        echo "  请执行以下步骤:"
-        echo "  1. 编辑 /etc/default/grub"
-        echo "  2. 在 GRUB_CMDLINE_LINUX 中添加: cgroup_enable=memory swapaccount=1"
-        echo "  3. 运行: grub2-mkconfig -o /boot/efi/EFI/openEuler/grub.cfg"
-        echo "  4. 重启系统"
-    else
-        # 挂载 memory cgroup
-        mkdir -p /sys/fs/cgroup/memory
-        mount -t cgroup -o memory none /sys/fs/cgroup/memory 2>/dev/null || {
-            echo "  ! 无法挂载 memory cgroup"
-            echo "  请检查内核启动参数是否包含: cgroup_enable=memory swapaccount=1"
-        }
+# ---- 4.2 启用 memory 控制器 ----
+if $CGROUP_V2_READY; then
+    echo "  配置 memory 控制器..."
 
-        if mount | grep -q "cgroup.*memory"; then
-            echo "  ✓ memory cgroup 挂载成功"
+    # 在根 cgroup 启用 memory 控制器
+    ROOT_SUBTREE="/sys/fs/cgroup/cgroup.subtree_control"
+    if [ -f "$ROOT_SUBTREE" ]; then
+        if ! grep -qw "memory" "$ROOT_SUBTREE" 2>/dev/null; then
+            echo "+memory" > "$ROOT_SUBTREE" 2>/dev/null || {
+                echo "  ! 无法在根 cgroup 启用 memory 控制器"
+                echo "    请检查: cat /sys/fs/cgroup/cgroup.controllers"
+                echo "    如果 memory 不在列表中，说明内核未编译 memory cgroup 支持"
+            }
+        fi
+        if grep -qw "memory" "$ROOT_SUBTREE" 2>/dev/null; then
+            echo "    ✓ memory 控制器已在根 cgroup 中启用"
         fi
     fi
 fi
 
-# 创建测试用的 cgroup
-if [ -d /sys/fs/cgroup/memory ]; then
-    mkdir -p /sys/fs/cgroup/memory/zswap_bench
-    echo "  ✓ cgroup 目录已创建: /sys/fs/cgroup/memory/zswap_bench"
+# ---- 4.3 创建测试 cgroup ----
+if $CGROUP_V2_READY; then
+    CGROUP_DIR="/sys/fs/cgroup/zswap_bench"
+
+    # 删除可能残留的旧 cgroup（确保干净状态）
+    if [ -d "$CGROUP_DIR" ]; then
+        # 如果 cgroup 中还有进程，先移走
+        if [ -f "$CGROUP_DIR/cgroup.procs" ] && [ -s "$CGROUP_DIR/cgroup.procs" ]; then
+            while read pid; do
+                echo "$pid" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+            done < "$CGROUP_DIR/cgroup.procs"
+        fi
+        rmdir "$CGROUP_DIR" 2>/dev/null || true
+    fi
+
+    mkdir -p "$CGROUP_DIR"
+    echo "    ✓ cgroup 目录已创建: $CGROUP_DIR"
+
+    # 在子 cgroup 中启用 memory 控制器（供更深层级使用）
+    if [ -f "$CGROUP_DIR/cgroup.subtree_control" ]; then
+        echo "+memory" > "$CGROUP_DIR/cgroup.subtree_control" 2>/dev/null || true
+    fi
+
+    # 设置内存限制 (与 zswap_benchmark.sh 保持一致)
+    MEM_LIMIT_SETUP="4G"
+    echo "$MEM_LIMIT_SETUP" > "$CGROUP_DIR/memory.max" 2>/dev/null || \
+        echo "  ! 无法设置 memory.max"
+    echo "$MEM_LIMIT_SETUP" > "$CGROUP_DIR/memory.high" 2>/dev/null || \
+        echo "  ! 无法设置 memory.high"
+    echo "max" > "$CGROUP_DIR/memory.swap.max" 2>/dev/null || \
+        echo "  ! 无法设置 memory.swap.max"
+    echo "    ✓ 内存限制已设置: memory.max=$MEM_LIMIT_SETUP, memory.high=$MEM_LIMIT_SETUP"
+
+    # 验证配置
+    echo ""
+    echo "  cgroup v2 配置验证:"
+    echo "    memory.max:         $(cat $CGROUP_DIR/memory.max 2>/dev/null)"
+    echo "    memory.high:        $(cat $CGROUP_DIR/memory.high 2>/dev/null)"
+    echo "    memory.swap.max:    $(cat $CGROUP_DIR/memory.swap.max 2>/dev/null)"
+    echo "    cgroup.controllers: $(cat $CGROUP_DIR/cgroup.controllers 2>/dev/null)"
+    echo "    cgroup.procs:       $(cat $CGROUP_DIR/cgroup.procs 2>/dev/null | wc -l) 个进程"
 fi
 
 # ========== 步骤 5: 加载压缩算法模块 ==========
@@ -180,7 +232,8 @@ echo ""
 echo "验证步骤:"
 echo "  1. 检查内核: uname -r"
 echo "  2. 检查 zswap: cat /sys/module/zswap/parameters/enabled"
-echo "  3. 检查 memory cgroup: ls /sys/fs/cgroup/memory/"
+echo "  3. 检查 cgroup v2: mount | grep cgroup2"
+echo "  4. 检查 memory 控制器: cat /sys/fs/cgroup/cgroup.controllers"
 echo ""
 echo "下一步:"
 echo "  1. 下载测试模型到 /tmp/llama.cpp/models/"

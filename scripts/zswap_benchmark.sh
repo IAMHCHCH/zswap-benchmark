@@ -49,31 +49,44 @@ check_dependencies() {
     fi
 }
 
-# 初始化 cgroup
+# 初始化 cgroup v2
 setup_cgroup() {
-    log_info "初始化 cgroup (内存限制: $MEM_LIMIT)..."
+    log_info "初始化 cgroup v2 (内存限制: $MEM_LIMIT)..."
 
-    # 检查 memory cgroup 是否可用
-    if [ ! -d /sys/fs/cgroup/memory ]; then
-        log_err "memory cgroup 未挂载，请先运行 setup_env.sh"
-        log_err "或手动挂载: mount -t cgroup -o memory none /sys/fs/cgroup/memory"
+    # 检查 cgroup v2 是否可用
+    if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        log_err "cgroup v2 未启用，请先配置内核启动参数:"
+        log_err "  systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all"
+        log_err "然后运行 setup_env.sh"
         exit 1
     fi
 
+    # 启用 memory 控制器
+    if ! grep -q "memory" /sys/fs/cgroup/cgroup.controllers 2>/dev/null && \
+       ! grep -q "memory" /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; then
+        log_info "启用 memory 控制器..."
+        echo "+memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null
+    fi
+
     # 创建 cgroup 目录
-    sudo mkdir -p /sys/fs/cgroup/memory/zswap_bench
+    sudo mkdir -p /sys/fs/cgroup/zswap_bench
+
+    # 在子 cgroup 中启用 memory 控制器
+    if [ -f /sys/fs/cgroup/zswap_bench/cgroup.subtree_control ]; then
+        echo "+memory" | sudo tee /sys/fs/cgroup/zswap_bench/cgroup.subtree_control > /dev/null 2>&1 || true
+    fi
 
     # 将当前进程加入 cgroup
-    echo $$ | sudo tee /sys/fs/cgroup/memory/zswap_bench/tasks > /dev/null
+    echo $$ | sudo tee /sys/fs/cgroup/zswap_bench/cgroup.procs > /dev/null
 
-    # 设置内存限制
-    echo "$MEM_LIMIT" | sudo tee /sys/fs/cgroup/memory/zswap_bench/memory.limit_in_bytes > /dev/null
-    echo "$MEM_LIMIT" | sudo tee /sys/fs/cgroup/memory/zswap_bench/memory.soft_limit_in_bytes > /dev/null
+    # 设置内存限制 (cgroup v2 接口)
+    echo "$MEM_LIMIT" | sudo tee /sys/fs/cgroup/zswap_bench/memory.max > /dev/null
+    echo "$MEM_LIMIT" | sudo tee /sys/fs/cgroup/zswap_bench/memory.high > /dev/null
 
-    # 设置 swappiness (越高越早使用 swap/zswap)
-    echo 100 | sudo tee /sys/fs/cgroup/memory/zswap_bench/memory.swappiness > /dev/null
+    # 启用 swap（不限制 swap 上限，让 zswap 尽可能工作）
+    echo "max" | sudo tee /sys/fs/cgroup/zswap_bench/memory.swap.max > /dev/null
 
-    log_info "cgroup 创建完成"
+    log_info "cgroup v2 创建完成"
 }
 
 # 配置 zswap
@@ -171,8 +184,8 @@ run_llama_bench() {
     log_info "运行 llama-bench: algo=$algo, threads=$threads"
     
     # 确保 cgroup 任务在组内
-    sudo sh -c "echo \$$ | tee /sys/fs/cgroup/memory/zswap_bench/tasks > /dev/null"
-    
+    echo $$ | sudo tee /sys/fs/cgroup/zswap_bench/cgroup.procs > /dev/null
+
     # 运行测试
     {
         echo "=== Llama Benchmark ==="
@@ -187,9 +200,10 @@ run_llama_bench() {
         echo ""
         echo "=== Output ==="
     } >> "$outfile"
-    
-    cgexec -g memory:zswap_bench \
-        llama-bench \
+
+    # cgroup v2: 将 llama-bench 进程加入 zswap_bench cgroup
+    sudo bash -c "echo \$$ > /sys/fs/cgroup/zswap_bench/cgroup.procs" 2>/dev/null || true
+    llama-bench \
         -m "$MODEL" \
         -p $PROMPT_LEN \
         -n $GEN_LEN \
@@ -215,8 +229,8 @@ run_memtest() {
             echo ""
         } >> "$outfile"
         
-        sudo cgexec -g memory:zswap_bench \
-            stress-ng --vm 1 --vm-bytes 80% --vm-method all \
+        sudo bash -c "echo \$$ > /sys/fs/cgroup/zswap_bench/cgroup.procs" 2>/dev/null || true
+        stress-ng --vm 1 --vm-bytes 80% --vm-method all \
             --timeout 30s 2>&1 | tee -a "$outfile"
     else
         log_warn "stress-ng 不可用，使用简单内存测试"
@@ -325,8 +339,8 @@ cleanup() {
     # 禁用 zswap
     echo 0 | sudo tee /sys/module/zswap/parameters/enabled > /dev/null 2>&1
     
-    # 删除 cgroup
-    sudo rmdir /sys/fs/cgroup/memory/zswap_bench 2>/dev/null || true
+    # 删除 cgroup v2
+    sudo rmdir /sys/fs/cgroup/zswap_bench 2>/dev/null || true
     
     log_info "清理完成"
 }
