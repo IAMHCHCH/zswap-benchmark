@@ -182,6 +182,48 @@ if $CGROUP_V2_READY; then
     echo "    memory.swap.max:    $(cat $CGROUP_DIR/memory.swap.max 2>/dev/null)"
     echo "    cgroup.controllers: $(cat $CGROUP_DIR/cgroup.controllers 2>/dev/null)"
     echo "    cgroup.procs:       $(cat $CGROUP_DIR/cgroup.procs 2>/dev/null | wc -l) 个进程"
+
+    # ---- 4.4 快速验证: 写入进程 + 观测 memory.current ----
+    echo ""
+    echo "  ---- cgroup v2 快速验证 ----"
+
+    # 将当前 shell 加入 zswap_bench cgroup
+    echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || {
+        echo "    ! 无法将进程加入 cgroup"
+    }
+    if grep -qw "$$" "$CGROUP_DIR/cgroup.procs" 2>/dev/null; then
+        echo "    ✓ 当前进程 ($$) 已加入 cgroup"
+    else
+        echo "    ! 进程加入 cgroup 失败"
+    fi
+
+    # 记录分配前的 memory.current
+    MEM_BEFORE=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null)
+    echo "    memory.current (分配前): $MEM_BEFORE bytes ($(( MEM_BEFORE / 1024 / 1024 )) MB)"
+
+    # 用 dd 在 tmpfs 上分配约 128MB，触发 cgroup 内存增长
+    dd if=/dev/zero of=/dev/shm/cgroup_test_$$ bs=1M count=128 2>/dev/null
+    sync
+
+    # 读取分配后的 memory.current
+    MEM_AFTER=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null)
+    echo "    memory.current (分配后): $MEM_AFTER bytes ($(( MEM_AFTER / 1024 / 1024 )) MB)"
+
+    # 清理
+    rm -f /dev/shm/cgroup_test_$$
+
+    # 将当前 shell 移回根 cgroup
+    echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+
+    # 判断结果
+    MEM_DIFF=$(( MEM_AFTER - MEM_BEFORE ))
+    if [ "$MEM_DIFF" -gt 1048576 ]; then
+        echo "    ✓ memory.current 变化: +$(( MEM_DIFF / 1024 / 1024 )) MB (cgroup v2 memory 统计工作正常)"
+    else
+        echo "    ! memory.current 变化过小 (+$(( MEM_DIFF / 1024 )) KB)，memory 控制器可能未正确启用"
+    fi
+
+    echo "  ---- 快速验证结束 ----"
 fi
 
 # ========== 步骤 5: 加载压缩算法模块 ==========
