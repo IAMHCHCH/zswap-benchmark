@@ -187,27 +187,24 @@ if $CGROUP_V2_READY; then
     echo ""
     echo "  ---- cgroup v2 快速验证 ----"
 
+    # 先将当前 shell 加入 zswap_bench cgroup
+    echo $$ > "$CGROUP_DIR/cgroup.procs"
+    if grep -qw "$$" "$CGROUP_DIR/cgroup.procs" 2>/dev/null; then
+        echo "    ✓ 当前 shell ($$) 已加入 cgroup"
+    else
+        echo "    ! 当前 shell 加入 cgroup 失败"
+    fi
+
     # 记录分配前的 memory.current
     MEM_BEFORE=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null)
     echo "    memory.current (分配前): $MEM_BEFORE bytes ($(( MEM_BEFORE / 1024 / 1024 )) MB)"
 
-    # 后台启动 python3 分配约 500MB 匿名内存，sleep 保持进程和内存存活
+    # 在 cgroup 内启动 python3 后台进程分配约 500MB 匿名内存
+    # 子进程自动继承父进程的 cgroup，无需单独写入 cgroup.procs
     python3 -c "x='a'*500000000;import time;time.sleep(10)" &
     pid=$!
-    echo "    测试进程 PID: $pid"
-
-    # 将 python3 进程加入 zswap_bench cgroup
-    echo $pid > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || {
-        echo "    ! 无法将进程加入 cgroup"
-    }
-    if grep -qw "$pid" "$CGROUP_DIR/cgroup.procs" 2>/dev/null; then
-        echo "    ✓ 进程 ($pid) 已加入 cgroup"
-    else
-        echo "    ! 进程加入 cgroup 失败"
-    fi
-
-    # 等待进程完成内存分配
-    sleep 2
+    echo "    测试进程 PID: $pid (继承 cgroup)"
+    sleep 3
 
     # 读取分配后的 memory.current
     MEM_AFTER=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null)
@@ -215,6 +212,9 @@ if $CGROUP_V2_READY; then
 
     # 等待后台 python3 进程结束（sleep 10 会自动退出）
     wait $pid 2>/dev/null || true
+
+    # 将当前 shell 移回根 cgroup
+    echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
 
     # 判断结果
     MEM_DIFF=$(( MEM_AFTER - MEM_BEFORE ))
