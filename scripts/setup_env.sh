@@ -187,34 +187,34 @@ if $CGROUP_V2_READY; then
     echo ""
     echo "  ---- cgroup v2 快速验证 ----"
 
-    # 将当前 shell 加入 zswap_bench cgroup
-    echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || {
-        echo "    ! 无法将进程加入 cgroup"
-    }
-    if grep -qw "$$" "$CGROUP_DIR/cgroup.procs" 2>/dev/null; then
-        echo "    ✓ 当前进程 ($$) 已加入 cgroup"
-    else
-        echo "    ! 进程加入 cgroup 失败"
-    fi
-
     # 记录分配前的 memory.current
     MEM_BEFORE=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null)
     echo "    memory.current (分配前): $MEM_BEFORE bytes ($(( MEM_BEFORE / 1024 / 1024 )) MB)"
 
-    # 用 python3 分配 128MB 匿名内存（anonymous memory），必然计入 cgroup memory.current
-    python3 -c "
-import time, mmap
-buf = mmap.mmap(-1, 128 * 1024 * 1024)  # 匿名 mmap，128MB
-buf.write(b'x' * (128 * 1024 * 1024))   # 触发物理页分配
-time.sleep(0.3)
-" 2>/dev/null || echo "    ! python3 执行失败，跳过验证"
+    # 后台启动 python3 分配约 500MB 匿名内存，sleep 保持进程和内存存活
+    python3 -c "x='a'*500000000;import time;time.sleep(10)" &
+    pid=$!
+    echo "    测试进程 PID: $pid"
+
+    # 将 python3 进程加入 zswap_bench cgroup
+    echo $pid > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || {
+        echo "    ! 无法将进程加入 cgroup"
+    }
+    if grep -qw "$pid" "$CGROUP_DIR/cgroup.procs" 2>/dev/null; then
+        echo "    ✓ 进程 ($pid) 已加入 cgroup"
+    else
+        echo "    ! 进程加入 cgroup 失败"
+    fi
+
+    # 等待进程完成内存分配
+    sleep 2
 
     # 读取分配后的 memory.current
     MEM_AFTER=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null)
     echo "    memory.current (分配后): $MEM_AFTER bytes ($(( MEM_AFTER / 1024 / 1024 )) MB)"
 
-    # 将当前 shell 移回根 cgroup
-    echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+    # 等待后台 python3 进程结束（sleep 10 会自动退出）
+    wait $pid 2>/dev/null || true
 
     # 判断结果
     MEM_DIFF=$(( MEM_AFTER - MEM_BEFORE ))
