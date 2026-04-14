@@ -87,9 +87,12 @@ check_dependencies() {
 detect_hw_accelerator() {
     log_info "检测 HiSilicon ZIP 硬件加速器..."
 
-    # 先卸载可能残留的旧模块, 再以指定参数重新加载
+    # 先 swapoff 再卸载可能残留的旧模块, 否则 hisi_zip 被 zswap 占用无法卸载
+    swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
     modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
+    # 重新启用 swapfile
+    swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
     HW_ACCEL_AVAILABLE=0
     ZIP_NUMA_NODE=""
@@ -242,10 +245,14 @@ configure_zswap() {
 
     # 控制硬件加速器: 仅在测试 "deflate"(非 sw) 时加载 hisi_zip
     # 其他算法均卸载 hisi_zip 以确保使用纯软件实现
+    # rmmod 前需 swapoff, 否则 zswap 占用 hisi_zip 导致卸载失败
+    swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
     if [ "$display_algo" = "deflate" ]; then
         modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
     fi
+    # 重新启用 swapfile (swapoff 后必须 swapon)
+    swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
     # 配置 zswap 参数
     echo 1 > /sys/module/zswap/parameters/enabled
