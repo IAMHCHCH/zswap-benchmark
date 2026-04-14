@@ -12,8 +12,7 @@ set -e
 
 # ========== 配置参数 ==========
 PER_THREAD_MEM="256M"                # 每线程分配内存
-CGROUP_MEM_HIGH="16G"                # cgroup memory.high (软节流阈值)
-CGROUP_MEM_MAX="24G"                 # cgroup memory.max (硬限制, 约为 HIGH 的 1.5 倍)
+CGROUP_MEM_HIGH="16G"                # cgroup memory.high (软节流阈值, 不设 max 避免 OOM)
 SWAPFILE_SIZE="16G"                  # swap 文件大小
 SWAPFILE="/swapfile"                 # swap 文件路径
 SWAP_PRIORITY=100                    # swap 优先级
@@ -21,7 +20,7 @@ THREADS="1 2 4 8 16 32 64 128"      # 线程数 (适配鲲鹏920 128核)
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 硬件deflate(hisi-deflate-acomp)
 TEST_DURATION=30                     # 每组测试持续时间 (秒)
 SAMPLE_INTERVAL=1                    # 采样间隔 (秒)
-MODEL=""                            # 测试模型路径 (留空则跳过 llama-bench)
+MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"   # 测试模型路径 (需下载 GGUF 模型, 留空则跳过)
 PROMPT_LEN=512                       # prompt 长度
 GEN_LEN=128                          # 生成长度
 ITERATIONS=3                         # 每组测试次数
@@ -87,9 +86,12 @@ check_dependencies() {
 detect_hw_accelerator() {
     log_info "检测 HiSilicon ZIP 硬件加速器..."
 
-    # 先卸载可能残留的旧模块, 再以指定参数重新加载
+    # 先 swapoff 再卸载可能残留的旧模块, 否则 hisi_zip 被 zswap 占用无法卸载
+    swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
     modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
+    # 重新启用 swapfile
+    swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
     HW_ACCEL_AVAILABLE=0
     ZIP_NUMA_NODE=""
@@ -171,7 +173,7 @@ prepare_swap() {
 
 # ========== cgroup v2 初始化 ==========
 setup_cgroup() {
-    log_info "初始化 cgroup v2 (memory.high=$CGROUP_MEM_HIGH, memory.max=$CGROUP_MEM_MAX)..."
+    log_info "初始化 cgroup v2 (memory.high=$CGROUP_MEM_HIGH, memory.max=max)..."
 
     # 检查 cgroup v2 是否可用
     if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
@@ -200,14 +202,17 @@ setup_cgroup() {
     echo $$ > "$CGROUP_DIR/cgroup.procs"
 
     # 设置内存限制
-    echo "$CGROUP_MEM_MAX" > "$CGROUP_DIR/memory.max"
+    # memory.max 保持 "max" 不设硬限制, 避免 OOM killer 杀进程
+    # 当 swap 空间耗尽后, 新的内存分配会在 page fault 处阻塞 (throttle),
+    # 直到已有页面被回收释放, 但进程不会被 kill
+    echo "max" > "$CGROUP_DIR/memory.max"
     echo "$CGROUP_MEM_HIGH" > "$CGROUP_DIR/memory.high"
 
     # 限制 swap 用量 (等于 swapfile 大小, 可观察满载)
     echo "$SWAPFILE_SIZE" > "$CGROUP_DIR/memory.swap.max"
 
     log_info "cgroup v2 创建完成:"
-    log_info "  memory.max   = $(cat $CGROUP_DIR/memory.max)"
+    log_info "  memory.max   = $(cat $CGROUP_DIR/memory.max) (不设硬限制, 避免 OOM)"
     log_info "  memory.high  = $(cat $CGROUP_DIR/memory.high)"
     log_info "  memory.swap.max = $(cat $CGROUP_DIR/memory.swap.max)"
 }
@@ -242,15 +247,20 @@ configure_zswap() {
 
     # 控制硬件加速器: 仅在测试 "deflate"(非 sw) 时加载 hisi_zip
     # 其他算法均卸载 hisi_zip 以确保使用纯软件实现
+    # rmmod 前需 swapoff, 否则 zswap 占用 hisi_zip 导致卸载失败
+    swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
     if [ "$display_algo" = "deflate" ]; then
         modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
     fi
+    # 重新启用 swapfile (swapoff 后必须 swapon)
+    swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
     # 配置 zswap 参数
     echo 1 > /sys/module/zswap/parameters/enabled
     echo "$algo" > /sys/module/zswap/parameters/compressor
     echo 25 > /sys/module/zswap/parameters/max_pool_percent
+    echo 0 > /sys/module/zswap/parameters/shrinker_enabled 2>/dev/null || true
 
     # 清空 pool
     if [ -w /sys/kernel/debug/zswap/flush_pool ]; then
@@ -260,6 +270,7 @@ configure_zswap() {
     # 验证配置
     local current_algo=$(cat /sys/module/zswap/parameters/compressor)
     local current_enabled=$(cat /sys/module/zswap/parameters/enabled)
+    local current_shrinker=$(cat /sys/module/zswap/parameters/shrinker_enabled 2>/dev/null || echo "N/A")
 
     local hw_status="软件"
     case $display_algo in
@@ -271,7 +282,7 @@ configure_zswap() {
         lzo)        hw_status="软件(lzo)" ;;
         zstd)       hw_status="软件(zstd)" ;;
     esac
-    log_info "zswap 配置: enabled=$current_enabled, compressor=$current_algo, 实现=$hw_status"
+    log_info "zswap 配置: enabled=$current_enabled, compressor=$current_algo, shrinker=$current_shrinker, 实现=$hw_status"
 
     sleep 1
 }
@@ -306,6 +317,232 @@ collect_zswap_stats() {
         echo "memory.high=$(cat $CGROUP_DIR/memory.high 2>/dev/null)"
         echo "memory.max=$(cat $CGROUP_DIR/memory.max 2>/dev/null)"
     } >> "$outfile"
+}
+
+# ========== 生成内存测试 Python 脚本 ==========
+generate_memtest_script() {
+    cat > "$RESULT_DIR/_memtest_runner.py" << 'PYEOF'
+#!/usr/bin/env python3
+"""Memory stress test runner: per-thread mmap allocation with throughput/CPU measurement."""
+
+import mmap
+import time
+import os
+import sys
+
+
+def read_proc_stat():
+    """Read CPU time breakdown from /proc/stat.
+    Returns (total, user, system, idle) in jiffies.
+    """
+    with open('/proc/stat') as f:
+        line = f.readline()
+    parts = line.split()[1:]
+    vals = [int(x) for x in parts[:8]]
+    total = sum(vals)
+    idle = vals[3] + vals[4]
+    user = vals[0] + vals[1]
+    system = vals[2] + vals[5] + vals[6]
+    return total, user, system, idle
+
+
+def main():
+    per_thread = int(sys.argv[1])
+    n_threads = int(sys.argv[2])
+    duration = int(sys.argv[3])
+    phasefile = sys.argv[4]
+    cgroup_dir = sys.argv[5]
+
+    # ============================================================
+    # Phase 1: Fork children, allocate memory, measure throughput
+    # ============================================================
+
+    wall_start = time.time()
+    pids = []
+    pipes = {}
+
+    for i in range(n_threads):
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            # --- Child process ---
+            os.close(r_fd)
+            try:
+                t0 = time.time()
+                buf = mmap.mmap(-1, per_thread)
+                page_size = 4096
+                for offset in range(0, per_thread, page_size):
+                    buf[offset] = 0xAA
+                t1 = time.time()
+                wt = t1 - t0
+                tp = (per_thread / 1024) / wt if wt > 0 else 0
+                os.write(w_fd, f'{wt:.6f},{tp:.2f}\n'.encode())
+                os.close(w_fd)
+                while True:
+                    time.sleep(1)
+            except Exception as e:
+                try:
+                    os.write(w_fd, f'ERROR:{e}\n'.encode())
+                except Exception:
+                    pass
+                try:
+                    os.close(w_fd)
+                except Exception:
+                    pass
+                os._exit(1)
+        else:
+            os.close(w_fd)
+            pids.append(pid)
+            pipes[pid] = r_fd
+
+    # Collect child stats via pipes
+    child_write_times = []
+    child_throughputs = []
+    n_ok = 0
+    for pid in pids:
+        try:
+            data = b''
+            while True:
+                chunk = os.read(pipes[pid], 256)
+                if not chunk:
+                    break
+                data += chunk
+            os.close(pipes[pid])
+            text = data.decode().strip()
+            if text.startswith('ERROR:'):
+                print(f'  Child {pid} failed: {text[6:]}')
+            else:
+                wt_str, tp_str = text.split(',')
+                child_write_times.append(float(wt_str))
+                child_throughputs.append(float(tp_str))
+                n_ok += 1
+        except Exception as e:
+            print(f'  Child {pid} read error: {e}')
+
+    wall_alloc_done = time.time()
+    alloc_elapsed = wall_alloc_done - wall_start
+
+    # Calculate throughput metrics
+    total_bytes = per_thread * n_threads
+    total_throughput = (total_bytes / 1024) / alloc_elapsed if alloc_elapsed > 0 else 0
+    avg_throughput = sum(child_throughputs) / len(child_throughputs) if child_throughputs else 0
+
+    print(f'METRICS:total_throughput_kbps={total_throughput:.2f}')
+    print(f'METRICS:avg_throughput_kbps={avg_throughput:.2f}')
+    print(f'METRICS:alloc_elapsed_sec={alloc_elapsed:.4f}')
+    print(f'METRICS:total_bytes={total_bytes}')
+    print(f'METRICS:n_threads_ok={n_ok}/{n_threads}')
+    sys.stdout.flush()
+
+    # ============================================================
+    # Phase 2: Hold memory and sample metrics
+    # ============================================================
+
+    cpu_before = read_proc_stat()
+
+    for sec in range(duration):
+        ts = time.time()
+
+        # cgroup metrics
+        try:
+            with open(os.path.join(cgroup_dir, 'memory.current')) as f:
+                mem_current = f.read().strip()
+        except Exception:
+            mem_current = '0'
+
+        try:
+            with open(os.path.join(cgroup_dir, 'memory.swap.current')) as f:
+                swap_current = f.read().strip()
+        except Exception:
+            swap_current = '0'
+
+        # zswap metrics
+        stored_pages = '0'
+        compressed_pages = '0'
+        try:
+            with open('/sys/kernel/debug/zswap/stored_pages') as f:
+                stored_pages = f.read().strip()
+        except Exception:
+            pass
+        try:
+            with open('/sys/kernel/debug/zswap/compressed_pages') as f:
+                compressed_pages = f.read().strip()
+        except Exception:
+            pass
+
+        # CPU metrics from /proc/stat
+        cpu_total, cpu_user, cpu_sys, cpu_idle = read_proc_stat()
+
+        # Write CSV row
+        with open(phasefile, 'a') as f:
+            f.write(f'{ts:.2f},{mem_current},{swap_current},'
+                    f'{stored_pages},{compressed_pages},'
+                    f'{cpu_user},{cpu_sys},{cpu_idle},{cpu_total}\n')
+
+        mem_mb = int(mem_current) // (1024 * 1024) if mem_current.isdigit() else 0
+        swap_mb = int(swap_current) // (1024 * 1024) if swap_current.isdigit() else 0
+        print(f'  [{sec+1}/{duration}s] memory={mem_mb}MB, swap={swap_mb}MB', flush=True)
+
+        time.sleep(1)
+
+    # ============================================================
+    # Phase 3: Kill children, collect final metrics
+    # ============================================================
+
+    cpu_after = read_proc_stat()
+    wall_end = time.time()
+    wall_elapsed = wall_end - wall_start
+
+    for pid in pids:
+        try:
+            os.kill(pid, 9)
+        except Exception:
+            pass
+
+    for pid in pids:
+        try:
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+
+    # Per-process CPU time (children cumulative)
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        proc_user_sec = ru.ru_utime
+        proc_sys_sec = ru.ru_stime
+    except Exception:
+        proc_user_sec = 0.0
+        proc_sys_sec = 0.0
+
+    # System-wide CPU breakdown during hold phase
+    cpu_d_total = cpu_after[0] - cpu_before[0]
+    cpu_d_user = cpu_after[1] - cpu_before[1]
+    cpu_d_sys = cpu_after[2] - cpu_before[2]
+    cpu_d_idle = cpu_after[3] - cpu_before[3]
+
+    if cpu_d_total > 0:
+        cpu_user_pct = cpu_d_user * 100.0 / cpu_d_total
+        cpu_sys_pct = cpu_d_sys * 100.0 / cpu_d_total
+        cpu_idle_pct = cpu_d_idle * 100.0 / cpu_d_total
+    else:
+        cpu_user_pct = 0.0
+        cpu_sys_pct = 0.0
+        cpu_idle_pct = 0.0
+
+    print(f'METRICS:user_time_sec={proc_user_sec:.4f}')
+    print(f'METRICS:sys_time_sec={proc_sys_sec:.4f}')
+    print(f'METRICS:wall_elapsed_sec={wall_elapsed:.4f}')
+    print(f'METRICS:cpu_user_pct={cpu_user_pct:.2f}')
+    print(f'METRICS:cpu_sys_pct={cpu_sys_pct:.2f}')
+    print(f'METRICS:cpu_idle_pct={cpu_idle_pct:.2f}')
+    print('All children terminated.', flush=True)
+
+
+if __name__ == '__main__':
+    main()
+PYEOF
+    chmod +x "$RESULT_DIR/_memtest_runner.py"
 }
 
 # ========== 内存压力测试 (核心) ==========
@@ -364,7 +601,7 @@ run_memtest() {
     } > "$outfile"
 
     # 写入采样 CSV 头
-    echo "timestamp,memory_current,swap_current,zswap_stored_pages,zswap_compressed_pages" > "$phasefile"
+    echo "timestamp,memory_current,swap_current,zswap_stored_pages,zswap_compressed_pages,cpu_user,cpu_system,cpu_idle,cpu_total" > "$phasefile"
 
     # 采集 zswap 测试前快照
     collect_zswap_stats "$algo" "$threads" "pre"
@@ -372,105 +609,10 @@ run_memtest() {
     # 记录启动时间
     local start_ts=$(date +%s)
 
-    # 启动 N 个子进程, 每个分配 per_thread_bytes 匿名内存
-    $numa_prefix python3 -c "
-import mmap, time, os, sys
-
-per_thread = $per_thread_bytes
-n_threads = $threads
-duration = $TEST_DURATION
-
-# 检查 cgroup 是否可用
-cgroup_dir = '$CGROUP_DIR'
-cgroup_procs = os.path.join(cgroup_dir, 'cgroup.procs')
-
-pids = []
-for i in range(n_threads):
-    pid = os.fork()
-    if pid == 0:
-        # 子进程: 分配内存并持有
-        try:
-            buf = mmap.mmap(-1, per_thread)
-            # 写入数据触发物理页分配 (每页 4KB 写一个字节)
-            page_size = 4096
-            for offset in range(0, per_thread, page_size):
-                buf[offset] = 0xAA
-            # 持有内存直到父进程通知退出
-            while True:
-                time.sleep(1)
-        except Exception as e:
-            print(f'Child {i} error: {e}', file=sys.stderr)
-            os._exit(1)
-    else:
-        pids.append(pid)
-
-# 等待所有子进程完成内存分配
-time.sleep(3)
-
-# 子进程自动继承父进程的 cgroup
-
-# 采样循环
-try:
-    for sec in range(duration):
-        ts = time.time()
-
-        # 读取 cgroup 指标
-        try:
-            with open(os.path.join(cgroup_dir, 'memory.current')) as f:
-                mem_current = f.read().strip()
-        except:
-            mem_current = '0'
-
-        try:
-            with open(os.path.join(cgroup_dir, 'memory.swap.current')) as f:
-                swap_current = f.read().strip()
-        except:
-            swap_current = '0'
-
-        # 读取 zswap 指标
-        stored_pages = '0'
-        compressed_pages = '0'
-        try:
-            with open('/sys/kernel/debug/zswap/stored_pages') as f:
-                stored_pages = f.read().strip()
-        except:
-            pass
-        try:
-            with open('/sys/kernel/debug/zswap/compressed_pages') as f:
-                compressed_pages = f.read().strip()
-        except:
-            pass
-
-        # 输出 CSV 行 (追加到 phasefile)
-        with open('$phasefile', 'a') as f:
-            f.write(f'{ts:.2f},{mem_current},{swap_current},{stored_pages},{compressed_pages}\n')
-
-        # 输出进度
-        mem_mb = int(mem_current) // (1024*1024) if mem_current.isdigit() else 0
-        swap_mb = int(swap_current) // (1024*1024) if swap_current.isdigit() else 0
-        print(f'  [{sec+1}/{duration}s] memory.current={mem_mb}MB, swap.current={swap_mb}MB', flush=True)
-
-        time.sleep($SAMPLE_INTERVAL)
-
-except KeyboardInterrupt:
-    pass
-
-# 终止所有子进程
-for pid in pids:
-    try:
-        os.kill(pid, 9)
-    except:
-        pass
-
-# 等待子进程退出
-for pid in pids:
-    try:
-        os.waitpid(pid, 0)
-    except:
-        pass
-
-print('All children terminated.')
-" 2>&1 | tee -a "$outfile"
+    # 启动内存压力测试 (独立 Python 脚本, 避免内联引号问题)
+    $numa_prefix python3 "$RESULT_DIR/_memtest_runner.py" \
+        "$per_thread_bytes" "$threads" "$TEST_DURATION" "$phasefile" "$CGROUP_DIR" \
+        2>&1 | tee -a "$outfile"
 
     local end_ts=$(date +%s)
     local elapsed=$((end_ts - start_ts))
@@ -572,7 +714,7 @@ generate_summary() {
         echo "CPU:          $(grep 'Model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
         echo "Memory:       $(grep MemTotal /proc/meminfo | awk '{print $2" kB"}')"
         echo "Cgroup High:  $CGROUP_MEM_HIGH"
-        echo "Cgroup Max:   $CGROUP_MEM_MAX"
+        echo "Cgroup Max:   max (不设硬限制)"
         echo "Swapfile:     $SWAPFILE ($SWAPFILE_SIZE, priority=$SWAP_PRIORITY)"
         echo "Per-Thread:   $PER_THREAD_MEM"
         echo "Test Duration: ${TEST_DURATION}s"
@@ -610,12 +752,36 @@ generate_summary() {
 
         for t in $THREADS; do
             local phasefile="$RESULT_DIR/phase_${algo}_t${t}.log"
+            local memtest_file="$RESULT_DIR/memtest_${algo}_t${t}.log"
             local zswap_pre="$RESULT_DIR/zswap_${algo}_t${t}_pre.log"
             local zswap_post="$RESULT_DIR/zswap_${algo}_t${t}_post.log"
             local total_mem_mb=$(( $(mem_to_bytes "$PER_THREAD_MEM") / 1024 / 1024 * t ))
 
             echo "" >> "$summary_file"
             echo "  Threads: $t  (total load: ${total_mem_mb}MB)" >> "$summary_file"
+
+            # 从 memtest log 提取 METRICS
+            if [ -f "$memtest_file" ]; then
+                local tp=$(grep "^METRICS:total_throughput_kbps=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local avg_tp=$(grep "^METRICS:avg_throughput_kbps=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local alloc_t=$(grep "^METRICS:alloc_elapsed_sec=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local user_t=$(grep "^METRICS:user_time_sec=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local sys_t=$(grep "^METRICS:sys_time_sec=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local wall_t=$(grep "^METRICS:wall_elapsed_sec=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local cpu_u=$(grep "^METRICS:cpu_user_pct=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local cpu_s=$(grep "^METRICS:cpu_sys_pct=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local cpu_i=$(grep "^METRICS:cpu_idle_pct=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+
+                [ -n "$tp" ] && echo "    Total Throughput:   ${tp} KB/s" >> "$summary_file"
+                [ -n "$avg_tp" ] && echo "    Avg Throughput:     ${avg_tp} KB/s" >> "$summary_file"
+                [ -n "$alloc_t" ] && echo "    Alloc Elapsed:      ${alloc_t} sec" >> "$summary_file"
+                [ -n "$wall_t" ] && echo "    Wall Elapsed:       ${wall_t} sec" >> "$summary_file"
+                [ -n "$user_t" ] && echo "    User Time:          ${user_t} sec" >> "$summary_file"
+                [ -n "$sys_t" ] && echo "    Sys Time:           ${sys_t} sec" >> "$summary_file"
+                [ -n "$cpu_u" ] && echo "    CPU User (业务):    ${cpu_u}%" >> "$summary_file"
+                [ -n "$cpu_s" ] && echo "    CPU Sys  (压缩):    ${cpu_s}%" >> "$summary_file"
+                [ -n "$cpu_i" ] && echo "    CPU Idle:           ${cpu_i}%" >> "$summary_file"
+            fi
 
             # 从 phase file 提取峰值指标
             if [ -f "$phasefile" ]; then
@@ -700,6 +866,9 @@ main() {
 
     # 创建结果目录
     mkdir -p "$RESULT_DIR"
+
+    # 生成内存测试 Python 脚本
+    generate_memtest_script
 
     # 检查依赖
     check_dependencies
