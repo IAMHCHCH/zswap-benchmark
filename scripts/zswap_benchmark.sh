@@ -61,25 +61,30 @@ setup_cgroup() {
         exit 1
     fi
 
-    # 启用 memory 控制器
-    if ! grep -q "memory" /sys/fs/cgroup/cgroup.controllers 2>/dev/null && \
-       ! grep -q "memory" /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; then
-        log_info "启用 memory 控制器..."
-        echo "+memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null
+    CGROUP_DIR="/sys/fs/cgroup/zswap_bench"
+
+    # 清理可能残留的旧 cgroup
+    if [ -d "$CGROUP_DIR" ]; then
+        if [ -f "$CGROUP_DIR/cgroup.procs" ] && [ -s "$CGROUP_DIR/cgroup.procs" ]; then
+            while read pid; do
+                echo "$pid" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+            done < "$CGROUP_DIR/cgroup.procs"
+        fi
+        rmdir "$CGROUP_DIR" 2>/dev/null || true
     fi
 
     # 创建 cgroup 目录
-    sudo mkdir -p /sys/fs/cgroup/zswap_bench
+    mkdir -p "$CGROUP_DIR"
 
     # 将当前进程加入 cgroup
-    echo $$ | sudo tee /sys/fs/cgroup/zswap_bench/cgroup.procs > /dev/null
+    echo $$ > "$CGROUP_DIR/cgroup.procs"
 
     # 设置内存限制 (cgroup v2 接口)
-    echo "$MEM_LIMIT" | sudo tee /sys/fs/cgroup/zswap_bench/memory.max > /dev/null
-    echo "$MEM_LIMIT" | sudo tee /sys/fs/cgroup/zswap_bench/memory.high > /dev/null
+    echo "$MEM_LIMIT" > "$CGROUP_DIR/memory.max"
+    echo "$MEM_LIMIT" > "$CGROUP_DIR/memory.high"
 
     # 启用 swap（不限制 swap 上限，让 zswap 尽可能工作）
-    echo "max" | sudo tee /sys/fs/cgroup/zswap_bench/memory.swap.max > /dev/null
+    echo "max" > "$CGROUP_DIR/memory.swap.max"
 
     log_info "cgroup v2 创建完成"
 }
@@ -119,13 +124,13 @@ configure_zswap() {
     fi
 
     # 配置参数
-    echo 1 | sudo tee /sys/module/zswap/parameters/enabled > /dev/null
-    echo "$algo" | sudo tee /sys/module/zswap/parameters/compressor > /dev/null
-    echo 25 | sudo tee /sys/module/zswap/parameters/max_pool_percent > /dev/null
+    echo 1 > /sys/module/zswap/parameters/enabled
+    echo "$algo" > /sys/module/zswap/parameters/compressor
+    echo 25 > /sys/module/zswap/parameters/max_pool_percent
 
     # 清空 pool
     if [ -w /sys/kernel/debug/zswap/flush_pool ]; then
-        echo 1 | sudo tee /sys/kernel/debug/zswap/flush_pool > /dev/null
+        echo 1 > /sys/kernel/debug/zswap/flush_pool
     fi
 
     # 验证配置
@@ -179,7 +184,7 @@ run_llama_bench() {
     log_info "运行 llama-bench: algo=$algo, threads=$threads"
     
     # 确保 cgroup 任务在组内
-    echo $$ | sudo tee /sys/fs/cgroup/zswap_bench/cgroup.procs > /dev/null
+    echo $$ > "$CGROUP_DIR/cgroup.procs"
 
     # 运行测试
     {
@@ -197,7 +202,7 @@ run_llama_bench() {
     } >> "$outfile"
 
     # cgroup v2: 将 llama-bench 进程加入 zswap_bench cgroup
-    sudo bash -c "echo \$$ > /sys/fs/cgroup/zswap_bench/cgroup.procs" 2>/dev/null || true
+    echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
     llama-bench \
         -m "$MODEL" \
         -p $PROMPT_LEN \
@@ -224,7 +229,7 @@ run_memtest() {
             echo ""
         } >> "$outfile"
         
-        sudo bash -c "echo \$$ > /sys/fs/cgroup/zswap_bench/cgroup.procs" 2>/dev/null || true
+        echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
         stress-ng --vm 1 --vm-bytes 80% --vm-method all \
             --timeout 30s 2>&1 | tee -a "$outfile"
     else
@@ -259,7 +264,7 @@ run_tests() {
             
             # 清空 zswap pool 为下一组测试
             if [ -w /sys/kernel/debug/zswap/flush_pool ]; then
-                echo 1 | sudo tee /sys/kernel/debug/zswap/flush_pool > /dev/null
+                echo 1 > /sys/kernel/debug/zswap/flush_pool
             fi
             sleep 3
         done
@@ -332,10 +337,13 @@ cleanup() {
     log_info "清理测试环境..."
     
     # 禁用 zswap
-    echo 0 | sudo tee /sys/module/zswap/parameters/enabled > /dev/null 2>&1
-    
-    # 删除 cgroup v2
-    sudo rmdir /sys/fs/cgroup/zswap_bench 2>/dev/null || true
+    echo 0 > /sys/module/zswap/parameters/enabled 2>/dev/null || true
+
+    # 将进程移回根 cgroup 后删除
+    if [ -n "$CGROUP_DIR" ] && [ -d "$CGROUP_DIR" ]; then
+        echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+        rmdir "$CGROUP_DIR" 2>/dev/null || true
+    fi
     
     log_info "清理完成"
 }
