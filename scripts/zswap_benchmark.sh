@@ -66,20 +66,34 @@ check_dependencies() {
 detect_hw_accelerator() {
     log_info "检测 HiSilicon ZIP 硬件加速器..."
 
-    # 尝试加载 hisi_zip 模块
-    modprobe hisi_zip 2>/dev/null || true
+    # 先卸载可能残留的旧模块, 再以指定参数重新加载
+    rmmod hisi_zip 2>/dev/null || true
+    modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
 
     if lsmod | grep -q hisi_zip; then
-        log_hw "HiSilicon ZIP 硬件加速器已加载 (hisi_zip)"
+        log_hw "HiSilicon ZIP 已加载 (uacc_mode=1, pf_q_num=256)"
 
-        # 检查硬件注册的算法
-        local hw_algos=""
-        grep -E "hisi-(lz4|deflate|zstd)-acomp" /proc/crypto 2>/dev/null | \
-            awk -F: '/driver/{print $2}' | tr -d ' ' | while read drv; do
-            hw_algos="$hw_algos $drv"
+        # 发现 ZIP 设备的 NUMA 拓扑
+        ZIP_NUMA_MAP=""
+        local dev_idx=0
+        for uacce in /sys/class/uacce/hisi_zip-*; do
+            if [ -d "$uacce" ]; then
+                local dev_name=$(basename "$uacce")
+                local node_id=""
+                if [ -f "$uacce/node_id" ]; then
+                    node_id=$(cat "$uacce/node_id" 2>/dev/null)
+                fi
+                if [ -n "$node_id" ]; then
+                    log_hw "  $dev_name -> NUMA node $node_id"
+                    ZIP_NUMA_MAP="$ZIP_NUMA_MAP $dev_name:$node_id"
+                else
+                    log_hw "  $dev_name -> NUMA node (未知)"
+                fi
+                dev_idx=$((dev_idx + 1))
+            fi
         done
 
-        # 更精确地检查每个算法的硬件支持
+        # 检查每个算法的硬件支持
         for algo in $ALGOS; do
             local drv_name=""
             case $algo in
@@ -92,6 +106,12 @@ detect_hw_accelerator() {
                 log_info "  $algo: 使用软件实现"
             fi
         done
+
+        # 打印系统 NUMA 拓扑摘要
+        if command -v numactl &> /dev/null; then
+            log_info "系统 NUMA 拓扑:"
+            numactl --hardware 2>/dev/null | head -10
+        fi
     else
         log_info "HiSilicon ZIP 硬件加速器不可用, 使用软件实现"
     fi
@@ -168,7 +188,8 @@ configure_zswap() {
 
     # 硬件加速 (HiSilicon ZIP, 支持 lz4/zstd, 不支持 lzo)
     if [ "$algo" != "lzo" ]; then
-        modprobe hisi_zip 2>/dev/null || true
+        rmmod hisi_zip 2>/dev/null || true
+        modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
     fi
 
     # 配置 zswap 参数
@@ -279,27 +300,42 @@ run_memtest() {
 
     echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
 
+    # 根据 ZIP 设备 NUMA 拓扑选择最优 node
+    # 对于多 socket 鲲鹏920, 选择与 ZIP 设备相同的 NUMA node 可获得最佳性能
+    local numa_opt=""
+    if [ -n "$ZIP_NUMA_MAP" ]; then
+        # 取第一个 ZIP 设备的 node id
+        local first_entry=$(echo $ZIP_NUMA_MAP | awk '{print $1}')
+        local zip_node=$(echo "$first_entry" | cut -d: -f2)
+        if [ -n "$zip_node" ] && command -v numactl &> /dev/null; then
+            numa_opt="numactl --cpunodebind=$zip_node --membind=$zip_node"
+            log_info "  NUMA 亲和: 绑定到 node $zip_node (ZIP 设备所在 node)"
+        fi
+    fi
+
     if command -v stress-ng &> /dev/null; then
         {
             echo "=== Memory Stress Test (stress-ng) ==="
             echo "Algorithm: $algo"
             echo "Threads: $threads"
             echo "Memory Limit: $MEM_LIMIT"
+            [ -n "$numa_opt" ] && echo "NUMA binding: $numa_opt"
             echo ""
         } >> "$outfile"
 
-        stress-ng --vm "$threads" --vm-bytes 80% --vm-method all \
+        $numa_opt stress-ng --vm "$threads" --vm-bytes 80% --vm-method all \
             --timeout 30s 2>&1 | tee -a "$outfile"
     else
         {
             echo "=== Memory Stress Test (python3) ==="
             echo "Algorithm: $algo"
             echo "Threads: $threads"
+            [ -n "$numa_opt" ] && echo "NUMA binding: $numa_opt"
             echo ""
         } >> "$outfile"
 
         # 使用 python3 分配匿名内存触发 zswap
-        python3 -c "
+        $numa_opt python3 -c "
 import mmap, time, os
 size = 512 * 1024 * 1024  # 512MB
 buf = mmap.mmap(-1, size)
@@ -362,9 +398,15 @@ generate_summary() {
         echo ""
         echo "Hardware Accelerator:"
         if lsmod | grep -q hisi_zip; then
-            echo "  HiSilicon ZIP: loaded"
+            echo "  HiSilicon ZIP: loaded (uacc_mode=1, pf_q_num=256)"
             grep -E "hisi-(lz4|deflate|zstd)-acomp" /proc/crypto 2>/dev/null | \
                 awk -F: '/driver/{print "  "$2}' || echo "  (no hw algos registered)"
+            # ZIP 设备 NUMA 拓扑
+            for uacce in /sys/class/uacce/hisi_zip-*; do
+                if [ -d "$uacce" ] && [ -f "$uacce/node_id" ]; then
+                    echo "  $(basename $uacce): NUMA node $(cat $uacce/node_id 2>/dev/null)"
+                fi
+            done
         else
             echo "  None (software only)"
         fi
