@@ -16,7 +16,7 @@ CGROUP_MEM_HIGH="16G"                # cgroup memory.high (软节流阈值, 不�
 SWAPFILE_SIZE="16G"                  # swap 文件大小
 SWAPFILE="/swapfile"                 # swap 文件路径
 SWAP_PRIORITY=100                    # swap 优先级
-THREADS="1 2 4 8 16 32 64 128"      # 线程数 (适配鲲鹏920 128核)
+THREADS="8 16 32 64 72 80 96 112 128 144 160"  # 三阶段均衡: 无swap(3) + zswap(5) + swap满(3), 64线程起进入二阶段
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 硬件deflate(hisi-deflate-acomp)
 TEST_DURATION=30                     # 每组测试持续时间 (秒)
 SAMPLE_INTERVAL=1                    # 采样间隔 (秒)
@@ -440,6 +440,19 @@ def main():
 
     cpu_before = read_proc_stat()
 
+    # Read cgroup cpu.stat baseline
+    cgroup_cpu_user_before = 0
+    cgroup_cpu_sys_before = 0
+    try:
+        with open(os.path.join(cgroup_dir, 'cpu.stat')) as f:
+            for line in f:
+                if line.startswith('user_usec'):
+                    cgroup_cpu_user_before = int(line.split()[1])
+                elif line.startswith('system_usec'):
+                    cgroup_cpu_sys_before = int(line.split()[1])
+    except Exception:
+        pass
+
     for sec in range(duration):
         ts = time.time()
 
@@ -486,12 +499,40 @@ def main():
         time.sleep(1)
 
     # ============================================================
-    # Phase 3: Kill children, collect final metrics
+    # Phase 3: Collect per-child CPU, then kill children
     # ============================================================
 
     cpu_after = read_proc_stat()
     wall_end = time.time()
     wall_elapsed = wall_end - wall_start
+
+    # Read per-child CPU usage before killing (utime=stat[13], stime=stat[14])
+    clk_tck = os.sysconf('SC_CLK_TCK') or 100
+    child_user_ticks = 0
+    child_sys_ticks = 0
+    for pid in pids:
+        try:
+            with open(f'/proc/{pid}/stat') as f:
+                stat = f.read().split()
+            child_user_ticks += int(stat[13])
+            child_sys_ticks += int(stat[14])
+        except Exception:
+            pass
+    child_user_sec = child_user_ticks / clk_tck
+    child_sys_sec = child_sys_ticks / clk_tck
+
+    # Read cgroup cpu.stat for per-cgroup user/sys breakdown
+    cgroup_cpu_user_after = 0
+    cgroup_cpu_sys_after = 0
+    try:
+        with open(os.path.join(cgroup_dir, 'cpu.stat')) as f:
+            for line in f:
+                if line.startswith('user_usec'):
+                    cgroup_cpu_user_after = int(line.split()[1])
+                elif line.startswith('system_usec'):
+                    cgroup_cpu_sys_after = int(line.split()[1])
+    except Exception:
+        pass
 
     for pid in pids:
         try:
@@ -530,12 +571,29 @@ def main():
         cpu_sys_pct = 0.0
         cpu_idle_pct = 0.0
 
+    # cgroup CPU delta: business (user) vs compression/kernel (sys)
+    cg_d_user = cgroup_cpu_user_after - cgroup_cpu_user_before
+    cg_d_sys = cgroup_cpu_sys_after - cgroup_cpu_sys_before
+    cg_d_total = cg_d_user + cg_d_sys
+    if cg_d_total > 0:
+        business_pct = cg_d_user * 100.0 / cg_d_total
+        compression_pct = cg_d_sys * 100.0 / cg_d_total
+    else:
+        business_pct = 0.0
+        compression_pct = 0.0
+
     print(f'METRICS:user_time_sec={proc_user_sec:.4f}')
     print(f'METRICS:sys_time_sec={proc_sys_sec:.4f}')
+    print(f'METRICS:child_user_sec={child_user_sec:.4f}')
+    print(f'METRICS:child_sys_sec={child_sys_sec:.4f}')
+    print(f'METRICS:cgroup_cpu_user_usec={cgroup_cpu_user_after}')
+    print(f'METRICS:cgroup_cpu_sys_usec={cgroup_cpu_sys_after}')
     print(f'METRICS:wall_elapsed_sec={wall_elapsed:.4f}')
     print(f'METRICS:cpu_user_pct={cpu_user_pct:.2f}')
     print(f'METRICS:cpu_sys_pct={cpu_sys_pct:.2f}')
     print(f'METRICS:cpu_idle_pct={cpu_idle_pct:.2f}')
+    print(f'METRICS:business_pct={business_pct:.2f}')
+    print(f'METRICS:compression_pct={compression_pct:.2f}')
     print('All children terminated.', flush=True)
 
 
@@ -661,6 +719,15 @@ run_llama_bench() {
     } >> "$outfile"
 
     echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
+
+    # 记录 llama-bench 运行前的 cgroup CPU
+    local llama_cpu_user_before=0
+    local llama_cpu_sys_before=0
+    if [ -f "$CGROUP_DIR/cpu.stat" ]; then
+        llama_cpu_user_before=$(grep "^user_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
+        llama_cpu_sys_before=$(grep "^system_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
+    fi
+
     llama-bench \
         -m "$MODEL" \
         -p $PROMPT_LEN \
@@ -668,6 +735,21 @@ run_llama_bench() {
         -t $threads \
         -r $ITERATIONS \
         2>&1 | tee -a "$outfile"
+
+    # 记录 llama-bench 运行后的 cgroup CPU, 计算增量
+    if [ -f "$CGROUP_DIR/cpu.stat" ]; then
+        local llama_cpu_user_after=$(grep "^user_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
+        local llama_cpu_sys_after=$(grep "^system_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
+        local llama_user_ms=$(( (llama_cpu_user_after - llama_cpu_user_before) / 1000 ))
+        local llama_sys_ms=$(( (llama_cpu_sys_after - llama_cpu_sys_before) / 1000 ))
+        {
+            echo ""
+            echo "=== Llama CPU Usage (cgroup delta) ==="
+            echo "llama_user_ms: $llama_user_ms"
+            echo "llama_sys_ms: $llama_sys_ms"
+        } >> "$outfile"
+        log_info "  llama CPU: user=${llama_user_ms}ms, sys=${llama_sys_ms}ms"
+    fi
 }
 
 # ========== 主测试循环 ==========
@@ -771,16 +853,22 @@ generate_summary() {
                 local cpu_u=$(grep "^METRICS:cpu_user_pct=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
                 local cpu_s=$(grep "^METRICS:cpu_sys_pct=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
                 local cpu_i=$(grep "^METRICS:cpu_idle_pct=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local biz=$(grep "^METRICS:business_pct=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local comp=$(grep "^METRICS:compression_pct=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local c_user=$(grep "^METRICS:child_user_sec=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
+                local c_sys=$(grep "^METRICS:child_sys_sec=" "$memtest_file" 2>/dev/null | tail -1 | cut -d= -f2)
 
                 [ -n "$tp" ] && echo "    Total Throughput:   ${tp} KB/s" >> "$summary_file"
                 [ -n "$avg_tp" ] && echo "    Avg Throughput:     ${avg_tp} KB/s" >> "$summary_file"
                 [ -n "$alloc_t" ] && echo "    Alloc Elapsed:      ${alloc_t} sec" >> "$summary_file"
                 [ -n "$wall_t" ] && echo "    Wall Elapsed:       ${wall_t} sec" >> "$summary_file"
-                [ -n "$user_t" ] && echo "    User Time:          ${user_t} sec" >> "$summary_file"
-                [ -n "$sys_t" ] && echo "    Sys Time:           ${sys_t} sec" >> "$summary_file"
-                [ -n "$cpu_u" ] && echo "    CPU User (业务):    ${cpu_u}%" >> "$summary_file"
-                [ -n "$cpu_s" ] && echo "    CPU Sys  (压缩):    ${cpu_s}%" >> "$summary_file"
-                [ -n "$cpu_i" ] && echo "    CPU Idle:           ${cpu_i}%" >> "$summary_file"
+                [ -n "$c_user" ] && echo "    Child User (业务):  ${c_user} sec" >> "$summary_file"
+                [ -n "$c_sys" ] && echo "    Child Sys  (压缩):  ${c_sys} sec" >> "$summary_file"
+                [ -n "$biz" ] && echo "    Business CPU%:      ${biz}%" >> "$summary_file"
+                [ -n "$comp" ] && echo "    Compression CPU%:   ${comp}%" >> "$summary_file"
+                [ -n "$cpu_u" ] && echo "    System CPU User%:   ${cpu_u}%" >> "$summary_file"
+                [ -n "$cpu_s" ] && echo "    System CPU Sys%:    ${cpu_s}%" >> "$summary_file"
+                [ -n "$cpu_i" ] && echo "    System CPU Idle%:   ${cpu_i}%" >> "$summary_file"
             fi
 
             # 从 phase file 提取峰值指标
