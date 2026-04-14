@@ -222,9 +222,9 @@ grep -E "lz4|zstd" /proc/crypto
 
 | 线程数 | 总负载 | 阶段 | 行为 |
 |--------|--------|------|------|
-| 1-32 | 0.25G-8G | 无 swap | 内存充裕 |
-| 64 | 16G | zswap 压缩 | 接近 cgroup high，触发压缩 |
-| 128 | 32G | swap 满载 | 超出容量，压力最大 |
+| 8, 16, 32 | 2G-8G | 无 swap | 内存充裕 |
+| 64, 72, 80, 96, 112 | 16G-28G | zswap 压缩 | 触发压缩 + swap 写入 |
+| 128, 144, 160 | 32G-40G | swap 满载 | swap 耗尽，分配阻塞 |
 
 ### 5.2 编辑测试脚本配置
 
@@ -239,7 +239,7 @@ PER_THREAD_MEM="256M"                # 每线程分配内存
 CGROUP_MEM_HIGH="16G"                # cgroup 软节流阈值
 CGROUP_MEM_MAX="24G"                 # cgroup 硬限制
 SWAPFILE_SIZE="16G"                  # swap 文件大小
-THREADS="1 2 4 8 16 32 64 128"      # 线程数梯度
+THREADS="8 16 32 64 72 80 96 112 128 144 160"  # 三阶段均衡线程梯度
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 压缩算法
 TEST_DURATION=30                     # 每组持续时间(秒)
 MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"  # llama-bench 模型路径
@@ -252,8 +252,22 @@ llama-bench 默认启用。需下载 GGUF 格式模型到指定路径：
 ```bash
 mkdir -p /tmp/llama.cpp/models/
 
-# 下载 GGUF 模型（例如 Qwen2.5-7B Q4_0 量化）
-# wget -O /tmp/llama.cpp/models/7b-q4_0.gguf <model_url>
+# 方法1: wget 直接下载 (推荐, 单文件约 4.4GB)
+wget -O /tmp/llama.cpp/models/7b-q4_0.gguf \
+    https://huggingface.co/second-state/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_0.gguf
+
+# 方法2: huggingface-cli (官方分片版本, 需 pip install huggingface_hub)
+huggingface-cli download Qwen/Qwen2.5-7B-Instruct-GGUF \
+    --include "qwen2.5-7b-instruct-q4_0*.gguf" \
+    --local-dir /tmp/llama.cpp/models/ \
+    --local-dir-use-symlinks False
+```
+
+验证模型文件：
+
+```bash
+ls -lh /tmp/llama.cpp/models/7b-q4_0.gguf
+# 应显示约 4.4GB 的文件
 ```
 
 > 若不下载模型，llama-bench 自动跳过，仅运行内存压力测试并采集吞吐量/CPU 指标。

@@ -99,6 +99,13 @@ class TestResult:
         self.cpu_user_pct: Optional[float] = None
         self.cpu_sys_pct: Optional[float] = None
         self.cpu_idle_pct: Optional[float] = None
+        self.child_user_sec: Optional[float] = None
+        self.child_sys_sec: Optional[float] = None
+        self.business_pct: Optional[float] = None
+        self.compression_pct: Optional[float] = None
+        # llama-bench CPU (从 bench log 解析)
+        self.llama_user_ms: Optional[int] = None
+        self.llama_sys_ms: Optional[int] = None
 
     @property
     def peak_memory_mb(self) -> Optional[int]:
@@ -245,6 +252,14 @@ class ZswapAnalyzer:
                     result.cpu_sys_pct = float(val)
                 elif key == 'cpu_idle_pct':
                     result.cpu_idle_pct = float(val)
+                elif key == 'child_user_sec':
+                    result.child_user_sec = float(val)
+                elif key == 'child_sys_sec':
+                    result.child_sys_sec = float(val)
+                elif key == 'business_pct':
+                    result.business_pct = float(val)
+                elif key == 'compression_pct':
+                    result.compression_pct = float(val)
             except ValueError:
                 pass
 
@@ -269,6 +284,14 @@ class ZswapAnalyzer:
         m = re.search(r'eval time:\s*([\d.]+)', content)
         if m:
             result.latency = float(m.group(1))
+
+        # llama CPU usage from cgroup delta
+        m = re.search(r'llama_user_ms:\s+(\d+)', content)
+        if m:
+            result.llama_user_ms = int(m.group(1))
+        m = re.search(r'llama_sys_ms:\s+(\d+)', content)
+        if m:
+            result.llama_sys_ms = int(m.group(1))
 
     # ---- 解析 zswap pre/post 快照 ----
     def parse_zswap_snapshot(self, filepath: Path):
@@ -437,19 +460,21 @@ class ZswapAnalyzer:
             lines.append("=" * 80)
             lines.append("")
             lines.append(f"{'Algorithm':<18} {'Threads':<10} {'User(s)':<12} "
-                         f"{'Sys(s)':<12} {'CPU User%':<12} {'CPU Sys%':<12} {'CPU Idle%':<12}")
-            lines.append("-" * 80)
+                         f"{'Sys(s)':<12} {'Biz%':<10} {'Comp%':<10} {'CPU User%':<12} {'CPU Sys%':<12} {'CPU Idle%':<12}")
+            lines.append("-" * 100)
             for algo in sorted(self.results.keys()):
                 results = sorted(self.results[algo], key=lambda x: x.threads)
                 label = ALGO_LABELS.get(algo, algo)
                 for r in results:
-                    ut = f"{r.user_time_sec:.3f}" if r.user_time_sec is not None else "N/A"
-                    st = f"{r.sys_time_sec:.3f}" if r.sys_time_sec is not None else "N/A"
-                    cu = f"{r.cpu_user_pct:.1f}" if r.cpu_user_pct is not None else "N/A"
-                    cs = f"{r.cpu_sys_pct:.1f}" if r.cpu_sys_pct is not None else "N/A"
-                    ci = f"{r.cpu_idle_pct:.1f}" if r.cpu_idle_pct is not None else "N/A"
-                    lines.append(f"{label:<18} {r.threads:<10} {ut:<12} "
-                                 f"{st:<12} {cu:<12} {cs:<12} {ci:<12}")
+                    cu = f"{r.child_user_sec:.3f}" if r.child_user_sec is not None else "N/A"
+                    cs = f"{r.child_sys_sec:.3f}" if r.child_sys_sec is not None else "N/A"
+                    biz = f"{r.business_pct:.1f}" if r.business_pct is not None else "N/A"
+                    comp = f"{r.compression_pct:.1f}" if r.compression_pct is not None else "N/A"
+                    sysu = f"{r.cpu_user_pct:.1f}" if r.cpu_user_pct is not None else "N/A"
+                    syss = f"{r.cpu_sys_pct:.1f}" if r.cpu_sys_pct is not None else "N/A"
+                    sysi = f"{r.cpu_idle_pct:.1f}" if r.cpu_idle_pct is not None else "N/A"
+                    lines.append(f"{label:<18} {r.threads:<10} {cu:<12} "
+                                 f"{cs:<12} {biz:<10} {comp:<10} {sysu:<12} {syss:<12} {sysi:<12}")
                 lines.append("")
 
         # ---- 5. Zswap Pool 统计 ----
@@ -655,34 +680,37 @@ class ZswapAnalyzer:
             fig.savefig(output_dir / 'time_vs_threads.png', dpi=150)
             plt.close(fig)
 
-        # ---- 图6: CPU Usage Breakdown (stacked bar) ----
-        has_cpu = any(r.cpu_user_pct is not None for algo in algos for r in self.results[algo])
-        if has_cpu:
+        # ---- 图6: CPU Usage Breakdown: Business vs Compression ----
+        has_biz = any(r.business_pct is not None for algo in algos for r in self.results[algo])
+        if has_biz:
             for algo in algos:
                 results = sorted(self.results[algo], key=lambda x: x.threads)
-                ts = [r.threads for r in results if r.cpu_user_pct is not None]
+                ts = [r.threads for r in results if r.business_pct is not None]
                 if not ts:
                     continue
-                u_vals = [r.cpu_user_pct for r in results if r.cpu_user_pct is not None]
-                s_vals = [r.cpu_sys_pct for r in results if r.cpu_sys_pct is not None]
-                i_vals = [r.cpu_idle_pct for r in results if r.cpu_idle_pct is not None]
+                biz_vals = [r.business_pct for r in results if r.business_pct is not None]
+                comp_vals = [r.compression_pct for r in results if r.compression_pct is not None]
 
                 fig, ax = plt.subplots(figsize=(12, 7))
                 bar_w = 0.8
                 x_pos = range(len(ts))
-                bars_u = ax.bar(x_pos, u_vals, bar_w, label='User (业务)', color='#2196F3')
-                bars_s = ax.bar(x_pos, s_vals, bar_w, bottom=u_vals, label='System (压缩/内核)', color='#FF9800')
-                tops = [u + s for u, s in zip(u_vals, s_vals)]
-                bars_i = ax.bar(x_pos, i_vals, bar_w, bottom=tops, label='Idle', color='#BDBDBD')
+                bars_biz = ax.bar(x_pos, biz_vals, bar_w, label='Business (user)', color='#2196F3')
+                bars_comp = ax.bar(x_pos, comp_vals, bar_w, bottom=biz_vals,
+                                   label='Compression/Kernel (sys)', color='#FF9800')
                 ax.set_xticks(x_pos)
                 ax.set_xticklabels([str(t) for t in ts])
                 ax.set_xlabel('Threads')
-                ax.set_ylabel('CPU Usage (%)')
+                ax.set_ylabel('CPU Usage within cgroup (%)')
                 ax.set_ylim(0, 105)
                 label = ALGO_LABELS.get(algo, algo)
-                ax.set_title(f'{label}: CPU Usage Breakdown')
+                ax.set_title(f'{label}: Business vs Compression CPU')
                 ax.legend(loc='upper right')
                 ax.grid(True, alpha=0.3, axis='y')
+                # Add value labels
+                for i, (b, c) in enumerate(zip(biz_vals, comp_vals)):
+                    ax.text(i, b / 2, f'{b:.0f}%', ha='center', va='center', fontsize=8, color='white')
+                    if c > 5:
+                        ax.text(i, b + c / 2, f'{c:.0f}%', ha='center', va='center', fontsize=8, color='white')
                 fig.tight_layout()
                 safe_algo = algo.replace('-', '_')
                 fig.savefig(output_dir / f'cpu_breakdown_{safe_algo}.png', dpi=150)
@@ -867,6 +895,12 @@ class ZswapAnalyzer:
                     'cpu_user_pct': r.cpu_user_pct,
                     'cpu_sys_pct': r.cpu_sys_pct,
                     'cpu_idle_pct': r.cpu_idle_pct,
+                    'child_user_sec': r.child_user_sec,
+                    'child_sys_sec': r.child_sys_sec,
+                    'business_pct': r.business_pct,
+                    'compression_pct': r.compression_pct,
+                    'llama_user_ms': r.llama_user_ms,
+                    'llama_sys_ms': r.llama_sys_ms,
                     'throughput': r.throughput,
                     'latency': r.latency,
                     'num_samples': len(r.samples),

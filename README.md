@@ -30,9 +30,9 @@ Linux kernel zswap 压缩算法性能对比测试工具，对比 **lz4 / deflate
 
 | 线程数 | 总负载 | 阶段 | 行为 |
 |--------|--------|------|------|
-| 1-32 | 0.25G-8G | **无 swap** | 内存充裕，无压缩开销 |
-| 64 | 16G | **zswap 压缩** | 接近 cgroup high，触发 zswap 压缩 |
-| 128 | 32G | **swap 满载** | 超出 cgroup + swap 容量，压力最大 |
+| 8, 16, 32 | 2G-8G | **无 swap** | 内存充裕，无压缩开销 |
+| 64, 72, 80, 96, 112 | 16G-28G | **zswap 压缩** | 接近/超出 cgroup high，触发压缩+swap |
+| 128, 144, 160 | 32G-40G | **swap 满载** | swap 耗尽，分配阻塞，压力最大 |
 
 ### 算法对比矩阵
 
@@ -103,7 +103,7 @@ CGROUP_MEM_MAX="24G"                 # cgroup 硬限制
 SWAPFILE_SIZE="16G"                  # swap 文件大小
 SWAPFILE="/swapfile"                 # swap 文件路径
 SWAP_PRIORITY=100                    # swap 优先级
-THREADS="1 2 4 8 16 32 64 128"      # 线程数梯度
+THREADS="8 16 32 64 72 80 96 112 128 144 160"  # 三阶段均衡线程梯度
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 压缩算法
 TEST_DURATION=30                     # 每组测试持续时间(秒)
 MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"  # llama-bench 模型路径
@@ -117,8 +117,17 @@ llama-bench 默认启用，需下载 GGUF 格式模型：
 
 ```bash
 mkdir -p /tmp/llama.cpp/models/
-# 下载任意 GGUF 模型到上述目录，例如 Qwen2.5-7B Q4_0 量化：
-# wget -O /tmp/llama.cpp/models/7b-q4_0.gguf <model_url>
+
+# 方法1: wget 直接下载 (推荐, 单文件)
+wget -O /tmp/llama.cpp/models/7b-q4_0.gguf \
+    https://huggingface.co/second-state/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_0.gguf
+
+# 方法2: huggingface-cli (官方分片版本)
+pip install huggingface_hub
+huggingface-cli download Qwen/Qwen2.5-7B-Instruct-GGUF \
+    --include "qwen2.5-7b-instruct-q4_0*.gguf" \
+    --local-dir /tmp/llama.cpp/models/ \
+    --local-dir-use-symlinks False
 ```
 
 > 若不下载模型，llama-bench 自动跳过，仅运行内存压力测试。
@@ -167,13 +176,16 @@ python3 analyze_results.py ../results/results_*/
 
 ### CPU 使用率
 
-通过 `/proc/stat` 采样计算系统级 CPU 占比：
+通过 cgroup `cpu.stat` 和 `/proc/pid/stat` 采集，分离业务与压缩开销：
 
-| 指标 | 说明 |
-|------|------|
-| CPU User% | 业务处理占比 |
-| CPU Sys% | 压缩/内核开销占比 |
-| CPU Idle% | 空闲占比 |
+| 指标 | 说明 | 来源 |
+|------|------|------|
+| Business% | 业务处理占比 (用户态) | cgroup cpu.stat user_usec delta |
+| Compression% | 压缩/内核开销占比 (内核态) | cgroup cpu.stat system_usec delta |
+| Child User (sec) | 子进程用户态 CPU 时间 (内存写入) | /proc/pid/stat utime |
+| Child Sys (sec) | 子进程内核态 CPU 时间 (含 zswap 压缩) | /proc/pid/stat stime |
+| Llama User (ms) | llama-bench 推理 CPU 时间 | cgroup cpu.stat delta |
+| Llama Sys (ms) | llama-bench 内核开销 | cgroup cpu.stat delta |
 
 ## 输出文件
 
@@ -193,7 +205,7 @@ python3 analyze_results.py ../results/results_*/
 |------|------|
 | `throughput_vs_threads.png` | **各算法总吞吐量随线程数变化** |
 | `time_vs_threads.png` | **分配耗时 + sys_time 随线程数变化（双面板）** |
-| `cpu_breakdown_algo.png` | **CPU 占比堆叠柱状图 (User/ Sys/ Idle)** |
+| `cpu_breakdown_algo.png` | **Business vs Compression CPU 堆叠柱状图** |
 | `memory_pressure.png` | 各算法 memory/swap 峰值随线程数变化 |
 | `timeseries_algo_tN.png` | 单算法 memory+swap 时间线 |
 | `swap_usage.png` | 各算法 swap 使用量对比 |
