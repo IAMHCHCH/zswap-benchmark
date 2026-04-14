@@ -186,16 +186,16 @@ sudo ./scripts/setup_env.sh
 脚本会自动执行以下操作：
 1. 检查内核 zswap 支持
 2. 检查压缩算法支持
-3. 安装系统依赖
-4. 配置 memory cgroup
-5. 加载压缩算法模块
+3. 安装系统依赖（gcc, cmake, python3, numactl 等）
+4. 配置 cgroup v2（含快速验证）
+5. 加载压缩算法模块（含 HiSilicon ZIP 硬件加速器）
 6. 编译 llama.cpp（可选）
 
 ### 4.2 手动安装依赖（如果脚本失败）
 
 ```bash
 # 安装基础依赖
-sudo yum install -y gcc gcc-c++ make git perf bc gawk libcgroup stress-ng python3 python3-matplotlib
+sudo yum install -y gcc gcc-c++ make cmake git bc numactl python3 python3-matplotlib
 
 # 加载压缩算法模块
 sudo modprobe lz4
@@ -209,25 +209,42 @@ grep -E "lz4|zstd" /proc/crypto
 
 ## 步骤五：配置测试参数
 
-### 5.1 编辑测试脚本配置
+### 5.1 测试模型说明
+
+测试脚本使用**固定每线程分配**模型：
+
+- 每线程分配 256MB 匿名内存
+- cgroup memory.high = 16G（软节流阈值）
+- cgroup memory.max = 24G（硬限制）
+- swapfile = 16G
+
+随线程数增长，自然经历三个阶段：
+
+| 线程数 | 总负载 | 阶段 | 行为 |
+|--------|--------|------|------|
+| 1-32 | 0.25G-8G | 无 swap | 内存充裕 |
+| 64 | 16G | zswap 压缩 | 接近 cgroup high，触发压缩 |
+| 128 | 32G | swap 满载 | 超出容量，压力最大 |
+
+### 5.2 编辑测试脚本配置
 
 ```bash
 vi scripts/zswap_benchmark.sh
 ```
 
-修改以下参数：
+主要配置参数：
 
 ```bash
-MEM_LIMIT="4G"                      # 内存限制（根据实际内存调整）
-THREADS="1 2 4 8 16 32 64 128"     # 线程数（鲲鹏920有128核）
-ALGOS="lz4 lzo zstd"                # 压缩算法
-MODEL="/tmp/llama.cpp/models/7B/m.gguf"  # 测试模型路径
-PROMPT_LEN=512                       # prompt 长度
-GEN_LEN=128                          # 生成长度
-ITERATIONS=3                         # 每组测试次数
+PER_THREAD_MEM="256M"                # 每线程分配内存
+CGROUP_MEM_HIGH="16G"                # cgroup 软节流阈值
+CGROUP_MEM_MAX="24G"                 # cgroup 硬限制
+SWAPFILE_SIZE="16G"                  # swap 文件大小
+THREADS="1 2 4 8 16 32 64 128"      # 线程数梯度
+ALGOS="lz4 deflate-sw lzo zstd deflate"  # 压缩算法
+TEST_DURATION=30                     # 每组持续时间(秒)
 ```
 
-### 5.2 下载测试模型（如果使用 llama-bench）
+### 5.3 下载测试模型（如果使用 llama-bench）
 
 ```bash
 # 创建模型目录
@@ -236,7 +253,12 @@ mkdir -p /tmp/llama.cpp/models/7B
 # 下载 GGUF 格式模型（示例）
 # 可以从 Hugging Face 下载，例如：
 # wget -O /tmp/llama.cpp/models/7B/m.gguf https://huggingface.co/.../model.gguf
+
+# 配置模型路径（编辑 zswap_benchmark.sh）
+# MODEL="/tmp/llama.cpp/models/7B/m.gguf"
 ```
+
+> **注意**: llama-bench 为可选功能，不配置模型时自动使用内存压力测试。
 
 ---
 
@@ -250,29 +272,60 @@ chmod +x zswap_benchmark.sh
 sudo ./zswap_benchmark.sh
 ```
 
-### 6.2 运行单独测试（可选）
+测试会依次执行所有 算法 × 线程数 的组合：
+
+```
+lz4:     1, 2, 4, 8, 16, 32, 64, 128 threads
+deflate-sw: 1, 2, 4, 8, 16, 32, 64, 128 threads
+lzo:     1, 2, 4, 8, 16, 32, 64, 128 threads
+zstd:    1, 2, 4, 8, 16, 32, 64, 128 threads
+deflate: 1, 2, 4, 8, 16, 32, 64, 128 threads (硬件加速)
+```
+
+每组测试约 30 秒，完整测试约需 25-30 分钟。
+
+### 6.2 测试输出说明
+
+测试过程中会看到实时进度：
+
+```
+[INFO] 内存压力测试: algo=lz4, threads=64, 总负载=16384MB
+[INFO]   cgroup memory.high=16384MB, swap=16384MB
+[INFO]   预期阶段: zswap 压缩
+  [1/30s] memory.current=15234MB, swap.current=0MB
+  [2/30s] memory.current=16345MB, swap.current=234MB
+  ...
+```
+
+### 6.3 快速验证测试（可选）
+
+如需快速验证环境是否正常，可以先只测试 lz4 + 少量线程：
 
 ```bash
-# 仅测试 lz4 算法
-sudo bash -c '
-echo 1 > /sys/module/zswap/parameters/enabled
-echo lz4 > /sys/module/zswap/parameters/compressor
-echo 25 > /sys/module/zswap/parameters/max_pool_percent
-cat /sys/module/zswap/parameters/*
-'
-
-# 查看 zswap 状态
-cat /sys/kernel/debug/zswap/*
-
-# 运行内存压力测试
-sudo stress-ng --vm 4 --vm-bytes 4G --timeout 60s
+# 编辑 zswap_benchmark.sh，临时修改：
+# ALGOS="lz4"
+# THREADS="1 8 64"
+sudo ./zswap_benchmark.sh
 ```
 
 ---
 
-## 步骤七：查看结果
+## 步骤七：查看和分析结果
 
-### 7.1 查看汇总报告
+### 7.1 结果文件结构
+
+```bash
+results/
+└── results_20260414_120000/          # 时间戳命名的结果目录
+    ├── summary.txt                   # 汇总报告
+    ├── phase_lz4_t64.log             # 逐秒采样 CSV
+    ├── memtest_lz4_t64.log           # 测试日志
+    ├── zswap_lz4_t64_pre.log         # 测试前 zswap 快照
+    ├── zswap_lz4_t64_post.log        # 测试后 zswap 快照
+    └── ...
+```
+
+### 7.2 查看汇总报告
 
 ```bash
 # 查看最新的结果目录
@@ -282,11 +335,32 @@ ls -la ../results/
 cat ../results/results_*/summary.txt
 ```
 
-### 7.2 分析结果
+### 7.3 生成分析图表
 
 ```bash
-# 使用 Python 分析脚本生成图表
+# 使用 Python 分析脚本生成图表和报告
 python3 analyze_results.py ../results/results_*/
+```
+
+生成的图表：
+
+| 图表 | 说明 |
+|------|------|
+| `memory_pressure.png` | 各算法 memory/swap 峰值随线程数变化 |
+| `timeseries_algo_tN.png` | 单算法的 memory+swap 时间线（有 swap 活动的线程数） |
+| `swap_usage.png` | 各算法 swap 使用量对比 |
+| `compression_ratio.png` | 各算法压缩比柱状图 |
+| `hw_vs_sw_deflate.png` | 硬件 vs 软件 deflate 三面板对比（memory/swap/compression） |
+| `all_algos_t128_timeline.png` | 所有算法最高线程数 memory+swap 时间线对比 |
+
+### 7.4 分析输出文件
+
+```bash
+# JSON 格式的完整结果数据
+cat ../results/results_*/results.json
+
+# 文本分析报告
+cat ../results/results_*/analysis_report.txt
 ```
 
 ---
@@ -300,6 +374,7 @@ python3 analyze_results.py ../results/results_*/
 grep CONFIG_ZSWAP /boot/config-$(uname -r)
 
 # 如果显示 "# CONFIG_ZSWAP is not set"，需要切换到支持 zswap 的内核
+# 参见步骤一
 ```
 
 ### Q2: cgroup v2 未启用
@@ -327,27 +402,68 @@ sudo modprobe lz4
 sudo modprobe zstd
 ```
 
-### Q4: llama-bench 编译失败
+### Q4: HiSilicon ZIP 硬件加速器不可用
 
 ```bash
-# 安装额外依赖
-sudo yum install -y cmake
+# 检查 hisi_zip 模块
+lsmod | grep hisi_zip
 
-# 手动编译
-cd /tmp/llama.cpp
-make clean
-make llama-bench -j$(nproc)
+# 尝试加载
+sudo modprobe hisi_zip uacc_mode=1 pf_q_num=256
+
+# 检查设备
+ls /sys/class/uacce/hisi_zip-*
+
+# 如果不可用，deflate 算法会自动回退到软件实现
+# 测试仍可正常进行
+```
+
+### Q5: swapfile 创建失败
+
+```bash
+# 检查磁盘空间
+df -h /
+
+# 检查是否有残留 swapfile
+swapon --show
+sudo swapoff /swapfile 2>/dev/null
+sudo rm -f /swapfile
+
+# 手动创建
+sudo fallocate -l 16G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile -p 100
+```
+
+### Q6: 测试过程中 OOM
+
+```bash
+# 如果系统 OOM killer 触发，可以:
+# 1. 降低线程梯度: THREADS="1 2 4 8 16 32 64"
+# 2. 增大 cgroup 限制: CGROUP_MEM_MAX="32G"
+# 3. 减小每线程分配: PER_THREAD_MEM="128M"
 ```
 
 ---
 
 ## 预期测试结果
 
+### 压缩性能对比
+
 | 算法 | 压缩比 | 压缩速度 | 适用场景 |
 |------|--------|----------|----------|
 | lz4 | ~1.8x | 最快 | 高吞吐、低延迟优先 |
 | lzo | ~2.0x | 中等 | 平衡场景 |
 | zstd | ~2.8x | 较慢 | 内存紧张、压缩比优先 |
+| deflate (sw) | ~2.2x | 中等 | 软件基准 |
+| deflate (hw) | ~2.2x | 快（硬件） | 鲲鹏920 硬件加速场景 |
+
+### 三阶段特征
+
+1. **无 swap 阶段** (1-32 threads): 各算法无显著差异，无压缩开销
+2. **zswap 压缩阶段** (64 threads): 压缩比高的算法 (zstd) 节省更多内存，但 CPU 开销更大
+3. **swap 满载阶段** (128 threads): 各算法均面临 swap thrashing，硬件加速的优势体现
 
 ---
 

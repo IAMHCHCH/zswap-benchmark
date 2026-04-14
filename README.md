@@ -1,15 +1,48 @@
 # Zswap Performance Benchmark
 
-Linux kernel zswap 压缩算法性能对比测试工具，对比 **lz4 / lzo / zstd** 在不同线程数下的性能线性变化。
+Linux kernel zswap 压缩算法性能对比测试工具，对比 **lz4 / deflate(sw) / lzo / zstd / deflate(hw)** 在不同线程数下的性能表现。
 
 ## 功能特性
 
-- 支持 lz4、lzo、zstd 三种压缩算法对比
-- 可配置内存限制（cgroup）
-- 线程数 1-128 线性扩展测试（适配鲲鹏920等多核处理器）
-- LLM 推理场景模拟（基于 llama.cpp）
-- 自动生成性能报告和线性度分析
-- 适配 openEuler 24.03 (LTS-SP2) aarch64 环境
+- 支持 5 种压缩配置对比：lz4、deflate(软件)、lzo、zstd、deflate(硬件 HiSilicon ZIP)
+- 每线程固定 256MB 内存分配，随线程增长自然触发三阶段内存压力
+- 三阶段观测：**无 swap → zswap 压缩 → swap 满载**
+- cgroup v2 隔离测试进程，精确控制内存上限
+- 独立 swapfile 管理，可配置大小和优先级
+- 逐秒采样 memory/swap/zswap 指标，生成完整时间线数据
+- 硬件加速器 NUMA 亲和绑定（deflate 绑定到 ZIP 设备所在 NUMA node）
+- 自动生成性能报告和多维度对比图表
+- 适配 openEuler 24.03 (LTS-SP2) aarch64 + 鲲鹏920 环境
+
+## 测试模型
+
+### 内存压力三阶段
+
+| 参数 | 值 |
+|------|-----|
+| 每线程分配 | 256MB |
+| cgroup memory.high | 16G（软节流） |
+| cgroup memory.max | 24G（硬限制） |
+| swapfile | 16G（priority=100） |
+| 线程梯度 | 1, 2, 4, 8, 16, 32, 64, 128 |
+
+随线程增长，内存压力自然经历三个阶段：
+
+| 线程数 | 总负载 | 阶段 | 行为 |
+|--------|--------|------|------|
+| 1-32 | 0.25G-8G | **无 swap** | 内存充裕，无压缩开销 |
+| 64 | 16G | **zswap 压缩** | 接近 cgroup high，触发 zswap 压缩 |
+| 128 | 32G | **swap 满载** | 超出 cgroup + swap 容量，压力最大 |
+
+### 算法对比矩阵
+
+| 算法 | 实现方式 | 说明 |
+|------|----------|------|
+| lz4 | 软件 | 最快压缩速度，低延迟 |
+| deflate-sw | 软件 (卸载 hisi_zip) | 纯软件 deflate 基准 |
+| lzo | 软件 | 平衡型压缩算法 |
+| zstd | 软件 | 高压缩比，适合内存紧张场景 |
+| deflate | 硬件 (hisi-deflate-acomp) | HiSilicon ZIP 加速，自动绑定 NUMA |
 
 ## 目录结构
 
@@ -20,7 +53,6 @@ zswap-benchmark/
 │   ├── analyze_results.py       # Python 分析脚本
 │   └── setup_env.sh            # 环境初始化（适配 openEuler）
 ├── docs/
-│   ├── test_plan.md            # 测试计划文档
 │   └── environment_a_guide.md  # 环境A操作指导
 ├── results/                    # 测试结果输出目录
 ├── .gitignore
@@ -32,9 +64,11 @@ zswap-benchmark/
 
 - **操作系统**: openEuler 24.03 (LTS-SP2) 或其他 Linux 发行版
 - **内核**: 需启用 zswap 支持 (CONFIG_ZSWAP=y)
+- **cgroup**: 需启用 cgroup v2 (内核启动参数 `systemd.unified_cgroup_hierarchy=1 cgroup_no_v1=all`)
 - **架构**: aarch64 / x86_64
-- **内存**: 至少 4GB（推荐 16GB+）
+- **内存**: 至少 16GB（推荐 64GB+）
 - **权限**: 需要 root 权限运行测试
+- **依赖**: python3, numactl, bc, awk
 
 ## 快速开始
 
@@ -45,75 +79,87 @@ zswap-benchmark/
 git clone https://github.com/IAMHCHCH/zswap-benchmark.git
 cd zswap-benchmark
 
-# 安装依赖
+# 安装依赖并初始化环境
 chmod +x scripts/setup_env.sh
 sudo ./scripts/setup_env.sh
-
-# 编译 llama.cpp
-git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
-cd /tmp/llama.cpp && make llama-bench
-sudo cp llama-bench /usr/local/bin/
 ```
+
+脚本会自动执行：
+1. 检查内核 zswap 支持
+2. 检查压缩算法支持
+3. 安装系统依赖（gcc, cmake, python3, numactl 等）
+4. 配置 cgroup v2（含快速验证）
+5. 加载压缩算法模块（含 HiSilicon ZIP 硬件加速器）
+6. 编译 llama.cpp（可选）
 
 ### 2. 配置测试参数
 
 编辑 `scripts/zswap_benchmark.sh` 中的配置：
 
 ```bash
-MEM_LIMIT="4G"              # 内存限制: 2G, 4G, 8G, 16G
-THREADS="1 2 4 8 16 32 64 128"  # 线程数（根据CPU核心数调整）
-ALGOS="lz4 lzo zstd"       # 压缩算法
-MODEL="models/qwen-7b.gguf"  # 测试模型路径
-PROMPT_LEN=512
-GEN_LEN=128
-ITERATIONS=3
+PER_THREAD_MEM="256M"                # 每线程分配内存
+CGROUP_MEM_HIGH="16G"                # cgroup 软节流阈值
+CGROUP_MEM_MAX="24G"                 # cgroup 硬限制
+SWAPFILE_SIZE="16G"                  # swap 文件大小
+SWAPFILE="/swapfile"                 # swap 文件路径
+SWAP_PRIORITY=100                    # swap 优先级
+THREADS="1 2 4 8 16 32 64 128"      # 线程数梯度
+ALGOS="lz4 deflate-sw lzo zstd deflate"  # 压缩算法
+TEST_DURATION=30                     # 每组测试持续时间(秒)
+SAMPLE_INTERVAL=1                    # 采样间隔(秒)
 ```
 
-> **详细操作指导**: 如果您使用的是 openEuler 或类似环境，请参考 [环境A操作指导](docs/environment_a_guide.md)，包含内核切换、memory cgroup 配置等详细步骤。
+> **详细操作指导**: 如果您使用的是 openEuler 或类似环境，请参考 [环境A操作指导](docs/environment_a_guide.md)，包含内核切换、cgroup v2 配置等详细步骤。
 
 ### 3. 运行测试
 
 ```bash
-cd scripts
-chmod +x zswap_benchmark.sh analyze_results.py
+cd zswap-benchmark/scripts
+chmod +x zswap_benchmark.sh
 sudo ./zswap_benchmark.sh
 ```
+
+测试流程（每组 algo x threads）：
+1. 配置 zswap 算法，加载/卸载硬件加速器
+2. 创建 cgroup，设置内存限制
+3. 准备 swapfile
+4. 启动 N 个子进程，每个 mmap 分配 256MB
+5. 逐秒采样 memory.current / swap.current / zswap stats（30 秒）
+6. 采集测试前后 zswap 快照，计算增量
 
 ### 4. 分析结果
 
 ```bash
 # 查看汇总报告
-cat ../results/summary_*.txt
+cat ../results/results_*/summary.txt
 
 # Python 分析（生成图表）
-python3 analyze_results.py ../results/
+python3 analyze_results.py ../results/results_*/
 ```
 
-## 测试矩阵
+## 输出文件
 
-| 参数 | 选项 |
+### 数据文件
+
+| 文件 | 格式 | 内容 |
+|------|------|------|
+| `phase_algo_tN.log` | CSV | 逐秒采样：timestamp, memory_current, swap_current, zswap_stored_pages, zswap_compressed_pages |
+| `zswap_algo_tN_pre.log` | 文本 | 测试前 zswap 快照（kernel params + debug stats + memory info） |
+| `zswap_algo_tN_post.log` | 文本 | 测试后 zswap 快照 |
+| `memtest_algo_tN.log` | 文本 | 测试日志（元数据 + 进度输出） |
+| `bench_algo_tN.log` | 文本 | llama-bench 输出（可选） |
+| `summary.txt` | 文本 | 汇总报告 |
+
+### 分析图表
+
+| 图表 | 说明 |
 |------|------|
-| 压缩算法 | lz4, lzo, zstd |
-| 内存限制 | 2GB, 4GB, 8GB, 16GB |
-| 线程数 | 1, 2, 4, 8, 12, 16, 32 |
-| 测试模型 | Qwen-7B, Llama-7B, Mistral-7B 等 GGUF 格式 |
-
-## 输出指标
-
-- **吞吐量**: tokens/s
-- **延迟**: P50, P95, P99 (ms)
-- **压缩比**: stored_pages / compressed_pages
-- **CPU 开销**: 压缩/解压缩 CPU 占用率
-- **内存带宽**: cache-misses, cache-references
-
-## 线性度分析
-
-```
-理想情况: 线程翻倍 → 吞吐量翻倍
-实际效率 = (throughput_N / throughput_1) / N × 100%
-
-效率下降拐点 → 内存带宽饱和点
-```
+| `memory_pressure.png` | 各算法 memory/swap 峰值随线程数变化 |
+| `timeseries_algo_tN.png` | 单算法单线程数的 memory+swap 时间线 |
+| `swap_usage.png` | 各算法 swap 使用量对比 |
+| `compression_ratio.png` | 各算法压缩比柱状图 |
+| `hw_vs_sw_deflate.png` | 硬件 vs 软件 deflate 三面板对比 |
+| `all_algos_tN_timeline.png` | 所有算法最高线程数 memory+swap 时间线 |
 
 ## 预期结果
 
@@ -122,13 +168,15 @@ python3 analyze_results.py ../results/
 | lz4 | ~1.8x | 最快 | 高吞吐、低延迟优先 |
 | lzo | ~2.0x | 中等 | 平衡场景 |
 | zstd | ~2.8x | 较慢 | 内存紧张、压缩比优先 |
+| deflate (sw) | ~2.2x | 中等 | 软件基准 |
+| deflate (hw) | ~2.2x | 快（硬件） | 鲲鹏920 硬件加速场景 |
 
 ## 注意事项
 
-1. 测试会修改系统 zswap 参数，需要 root 权限
-2. 建议在测试前备份重要数据
-3. 使用 cgroup 隔离测试进程
-4. 首次测试建议从较高内存限制开始
+1. 测试会修改系统 zswap 参数并创建 swapfile，需要 root 权限
+2. 测试结束后自动清理 swapfile 和 cgroup
+3. 测试期间系统内存压力较大，建议在专用测试环境运行
+4. 首次测试建议从较高内存限制开始（默认 16G cgroup + 16G swap）
 
 ## License
 
