@@ -89,6 +89,16 @@ class TestResult:
         # llama-bench (可选)
         self.throughput: Optional[float] = None
         self.latency: Optional[float] = None
+        # 吞吐量/CPU 指标 (从 METRICS 行解析)
+        self.total_throughput_kbps: Optional[float] = None
+        self.avg_throughput_kbps: Optional[float] = None
+        self.alloc_elapsed_sec: Optional[float] = None
+        self.user_time_sec: Optional[float] = None
+        self.sys_time_sec: Optional[float] = None
+        self.wall_elapsed_sec: Optional[float] = None
+        self.cpu_user_pct: Optional[float] = None
+        self.cpu_sys_pct: Optional[float] = None
+        self.cpu_idle_pct: Optional[float] = None
 
     @property
     def peak_memory_mb(self) -> Optional[int]:
@@ -178,7 +188,7 @@ class ZswapAnalyzer:
 
         return result
 
-    # ---- 解析 memtest_*.log 头部 (元数据) ----
+    # ---- 解析 memtest_*.log 头部 + METRICS ----
     def parse_memtest_header(self, filepath: Path):
         if not filepath.exists():
             return
@@ -207,6 +217,36 @@ class ZswapAnalyzer:
         m = re.search(r'Duration:\s+(\d+)s', content)
         if m:
             result.duration = int(m.group(1))
+
+        # 解析 METRICS: 行
+        for line in content.splitlines():
+            if not line.startswith('METRICS:'):
+                continue
+            m = re.match(r'METRICS:(\w+)=(.+)', line)
+            if not m:
+                continue
+            key, val = m.group(1), m.group(2)
+            try:
+                if key == 'total_throughput_kbps':
+                    result.total_throughput_kbps = float(val)
+                elif key == 'avg_throughput_kbps':
+                    result.avg_throughput_kbps = float(val)
+                elif key == 'alloc_elapsed_sec':
+                    result.alloc_elapsed_sec = float(val)
+                elif key == 'user_time_sec':
+                    result.user_time_sec = float(val)
+                elif key == 'sys_time_sec':
+                    result.sys_time_sec = float(val)
+                elif key == 'wall_elapsed_sec':
+                    result.wall_elapsed_sec = float(val)
+                elif key == 'cpu_user_pct':
+                    result.cpu_user_pct = float(val)
+                elif key == 'cpu_sys_pct':
+                    result.cpu_sys_pct = float(val)
+                elif key == 'cpu_idle_pct':
+                    result.cpu_idle_pct = float(val)
+            except ValueError:
+                pass
 
     # ---- 解析 llama-bench 输出 ----
     def parse_bench_log(self, filepath: Path):
@@ -367,9 +407,54 @@ class ZswapAnalyzer:
                              f"{phase:<16} {ratio:<10} {delta:<14}")
             lines.append("")
 
-        # ---- 3. Zswap Pool 统计 ----
+        # ---- 3. 吞吐量/性能指标 ----
+        has_tp = any(r.total_throughput_kbps for algo in self.results.values() for r in algo)
+        if has_tp:
+            lines.append("=" * 80)
+            lines.append("  3. 吞吐量 / 性能指标")
+            lines.append("=" * 80)
+            lines.append("")
+            lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Total KB/s':<14} "
+                         f"{'Avg KB/s':<14} {'Alloc(s)':<12} {'Wall(s)':<10}")
+            lines.append("-" * 80)
+            for algo in sorted(self.results.keys()):
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                label = ALGO_LABELS.get(algo, algo)
+                for r in results:
+                    tp = f"{r.total_throughput_kbps:.0f}" if r.total_throughput_kbps else "N/A"
+                    avg = f"{r.avg_throughput_kbps:.0f}" if r.avg_throughput_kbps else "N/A"
+                    at = f"{r.alloc_elapsed_sec:.3f}" if r.alloc_elapsed_sec else "N/A"
+                    wt = f"{r.wall_elapsed_sec:.2f}" if r.wall_elapsed_sec else "N/A"
+                    lines.append(f"{label:<18} {r.threads:<10} {tp:<14} "
+                                 f"{avg:<14} {at:<12} {wt:<10}")
+                lines.append("")
+
+        # ---- 4. 时间/CPU 开销 ----
+        has_cpu = any(r.sys_time_sec is not None for algo in self.results.values() for r in algo)
+        if has_cpu:
+            lines.append("=" * 80)
+            lines.append("  4. 时间与 CPU 开销")
+            lines.append("=" * 80)
+            lines.append("")
+            lines.append(f"{'Algorithm':<18} {'Threads':<10} {'User(s)':<12} "
+                         f"{'Sys(s)':<12} {'CPU User%':<12} {'CPU Sys%':<12} {'CPU Idle%':<12}")
+            lines.append("-" * 80)
+            for algo in sorted(self.results.keys()):
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                label = ALGO_LABELS.get(algo, algo)
+                for r in results:
+                    ut = f"{r.user_time_sec:.3f}" if r.user_time_sec is not None else "N/A"
+                    st = f"{r.sys_time_sec:.3f}" if r.sys_time_sec is not None else "N/A"
+                    cu = f"{r.cpu_user_pct:.1f}" if r.cpu_user_pct is not None else "N/A"
+                    cs = f"{r.cpu_sys_pct:.1f}" if r.cpu_sys_pct is not None else "N/A"
+                    ci = f"{r.cpu_idle_pct:.1f}" if r.cpu_idle_pct is not None else "N/A"
+                    lines.append(f"{label:<18} {r.threads:<10} {ut:<12} "
+                                 f"{st:<12} {cu:<12} {cs:<12} {ci:<12}")
+                lines.append("")
+
+        # ---- 5. Zswap Pool 统计 ----
         lines.append("=" * 80)
-        lines.append("  3. Zswap Pool 统计 (post-test)")
+        lines.append("  5. Zswap Pool 统计 (post-test)")
         lines.append("=" * 80)
         lines.append("")
         lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Pool Size':<14} "
@@ -389,11 +474,11 @@ class ZswapAnalyzer:
                              f"{limit:<12} {rej_poor:<12} {rej_alloc:<12}")
             lines.append("")
 
-        # ---- 4. llama-bench 结果 (可选) ----
+        # ---- 6. llama-bench 结果 (可选) ----
         has_tps = any(r.throughput for algo in self.results.values() for r in algo)
         if has_tps:
             lines.append("=" * 80)
-            lines.append("  4. llama-bench 结果")
+            lines.append("  6. llama-bench 结果")
             lines.append("=" * 80)
             lines.append("")
             lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Tokens/s':<15} {'Latency(ms)':<12}")
@@ -510,7 +595,100 @@ class ZswapAnalyzer:
         fig.savefig(output_dir / 'swap_usage.png', dpi=150)
         plt.close(fig)
 
-        # ---- 图4: 压缩比对比 (柱状图) ----
+        # ---- 图4: Total Throughput vs Threads ----
+        has_tp = any(r.total_throughput_kbps for algo in algos for r in self.results[algo])
+        if has_tp:
+            fig, ax = plt.subplots(figsize=(14, 8))
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                ts = [r.threads for r in results if r.total_throughput_kbps]
+                vals = [r.total_throughput_kbps for r in results if r.total_throughput_kbps]
+                if ts:
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(ts, vals, 'o-', label=label, color=color, linewidth=2)
+            ax.set_xlabel('Threads')
+            ax.set_ylabel('Total Throughput (KB/s)')
+            ax.set_title('Zswap Benchmark: Total Throughput vs Threads')
+            ax.legend(loc='upper left')
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(output_dir / 'throughput_vs_threads.png', dpi=150)
+            plt.close(fig)
+
+        # ---- 图5: Elapsed / Sys Time vs Threads ----
+        has_time = any(r.alloc_elapsed_sec is not None for algo in algos for r in self.results[algo])
+        if has_time:
+            fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+            ax = axes[0]
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                ts = [r.threads for r in results if r.alloc_elapsed_sec is not None]
+                vals = [r.alloc_elapsed_sec for r in results if r.alloc_elapsed_sec is not None]
+                if ts:
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(ts, vals, 'o-', label=label, color=color, linewidth=2)
+            ax.set_xlabel('Threads')
+            ax.set_ylabel('Alloc Elapsed Time (sec)')
+            ax.set_title('Memory Allocation Time vs Threads')
+            ax.legend(loc='upper left', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+            ax = axes[1]
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                ts = [r.threads for r in results if r.sys_time_sec is not None]
+                vals = [r.sys_time_sec for r in results if r.sys_time_sec is not None]
+                if ts:
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(ts, vals, 'o-', label=label, color=color, linewidth=2)
+            ax.set_xlabel('Threads')
+            ax.set_ylabel('System Time (sec)')
+            ax.set_title('Kernel/Compression Time vs Threads')
+            ax.legend(loc='upper left', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+            fig.tight_layout()
+            fig.savefig(output_dir / 'time_vs_threads.png', dpi=150)
+            plt.close(fig)
+
+        # ---- 图6: CPU Usage Breakdown (stacked bar) ----
+        has_cpu = any(r.cpu_user_pct is not None for algo in algos for r in self.results[algo])
+        if has_cpu:
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                ts = [r.threads for r in results if r.cpu_user_pct is not None]
+                if not ts:
+                    continue
+                u_vals = [r.cpu_user_pct for r in results if r.cpu_user_pct is not None]
+                s_vals = [r.cpu_sys_pct for r in results if r.cpu_sys_pct is not None]
+                i_vals = [r.cpu_idle_pct for r in results if r.cpu_idle_pct is not None]
+
+                fig, ax = plt.subplots(figsize=(12, 7))
+                bar_w = 0.8
+                x_pos = range(len(ts))
+                bars_u = ax.bar(x_pos, u_vals, bar_w, label='User (业务)', color='#2196F3')
+                bars_s = ax.bar(x_pos, s_vals, bar_w, bottom=u_vals, label='System (压缩/内核)', color='#FF9800')
+                tops = [u + s for u, s in zip(u_vals, s_vals)]
+                bars_i = ax.bar(x_pos, i_vals, bar_w, bottom=tops, label='Idle', color='#BDBDBD')
+                ax.set_xticks(x_pos)
+                ax.set_xticklabels([str(t) for t in ts])
+                ax.set_xlabel('Threads')
+                ax.set_ylabel('CPU Usage (%)')
+                ax.set_ylim(0, 105)
+                label = ALGO_LABELS.get(algo, algo)
+                ax.set_title(f'{label}: CPU Usage Breakdown')
+                ax.legend(loc='upper right')
+                ax.grid(True, alpha=0.3, axis='y')
+                fig.tight_layout()
+                safe_algo = algo.replace('-', '_')
+                fig.savefig(output_dir / f'cpu_breakdown_{safe_algo}.png', dpi=150)
+                plt.close(fig)
+
+        # ---- 图7: 压缩比对比 (柱状图) ----
         fig, ax = plt.subplots(figsize=(12, 7))
         labels = []
         ratios = []
@@ -539,7 +717,7 @@ class ZswapAnalyzer:
             fig.savefig(output_dir / 'compression_ratio.png', dpi=150)
             plt.close(fig)
 
-        # ---- 图5: 硬件 vs 软件对比 (deflate) ----
+        # ---- 图8: 硬件 vs 软件对比 (deflate) ----
         if 'deflate' in self.results and 'deflate-sw' in self.results:
             fig, axes = plt.subplots(1, 3, figsize=(20, 6))
 
@@ -600,7 +778,7 @@ class ZswapAnalyzer:
             fig.savefig(output_dir / 'hw_vs_sw_deflate.png', dpi=150)
             plt.close(fig)
 
-        # ---- 图6: 各算法逐秒内存时间线对比 (最高线程数) ----
+        # ---- 图9: 各算法逐秒内存时间线对比 (最高线程数) ----
         max_threads = 0
         for algo in algos:
             results = sorted(self.results[algo], key=lambda x: x.threads)
@@ -680,6 +858,15 @@ class ZswapAnalyzer:
                     'peak_swap_mb': r.peak_swap_mb,
                     'compression_ratio': r.compression_ratio,
                     'zswap_delta_mb': r.zswap_delta_mb,
+                    'total_throughput_kbps': r.total_throughput_kbps,
+                    'avg_throughput_kbps': r.avg_throughput_kbps,
+                    'alloc_elapsed_sec': r.alloc_elapsed_sec,
+                    'user_time_sec': r.user_time_sec,
+                    'sys_time_sec': r.sys_time_sec,
+                    'wall_elapsed_sec': r.wall_elapsed_sec,
+                    'cpu_user_pct': r.cpu_user_pct,
+                    'cpu_sys_pct': r.cpu_sys_pct,
+                    'cpu_idle_pct': r.cpu_idle_pct,
                     'throughput': r.throughput,
                     'latency': r.latency,
                     'num_samples': len(r.samples),

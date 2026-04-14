@@ -106,12 +106,24 @@ SWAP_PRIORITY=100                    # swap 优先级
 THREADS="1 2 4 8 16 32 64 128"      # 线程数梯度
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 压缩算法
 TEST_DURATION=30                     # 每组测试持续时间(秒)
-SAMPLE_INTERVAL=1                    # 采样间隔(秒)
+MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"  # llama-bench 模型路径
 ```
 
 > **详细操作指导**: 如果您使用的是 openEuler 或类似环境，请参考 [环境A操作指导](docs/environment_a_guide.md)，包含内核切换、cgroup v2 配置等详细步骤。
 
-### 3. 运行测试
+### 3. 下载 llama-bench 模型（可选）
+
+llama-bench 默认启用，需下载 GGUF 格式模型：
+
+```bash
+mkdir -p /tmp/llama.cpp/models/
+# 下载任意 GGUF 模型到上述目录，例如 Qwen2.5-7B Q4_0 量化：
+# wget -O /tmp/llama.cpp/models/7b-q4_0.gguf <model_url>
+```
+
+> 若不下载模型，llama-bench 自动跳过，仅运行内存压力测试。
+
+### 4. 运行测试
 
 ```bash
 cd zswap-benchmark/scripts
@@ -123,11 +135,12 @@ sudo ./zswap_benchmark.sh
 1. 配置 zswap 算法，加载/卸载硬件加速器
 2. 创建 cgroup，设置内存限制
 3. 准备 swapfile
-4. 启动 N 个子进程，每个 mmap 分配 256MB
-5. 逐秒采样 memory.current / swap.current / zswap stats（30 秒）
-6. 采集测试前后 zswap 快照，计算增量
+4. 启动 N 个子进程，每个 mmap 分配 256MB，测量写入吞吐量
+5. 逐秒采样 memory/swap/zswap/CPU 指标（30 秒）
+6. 终止子进程，采集 user/sys 时间和 CPU 占比
+7. 可选: 运行 llama-bench 测量 LLM 推理性能
 
-### 4. 分析结果
+### 5. 分析结果
 
 ```bash
 # 查看汇总报告
@@ -137,16 +150,40 @@ cat ../results/results_*/summary.txt
 python3 analyze_results.py ../results/results_*/
 ```
 
+## 输出指标
+
+### 数据处理带宽
+
+每组测试自动采集以下指标：
+
+| 指标 | 说明 |
+|------|------|
+| Total Throughput (KB/s) | 总写入吞吐量 = 总字节数 / 分配耗时 |
+| Average Throughput (KB/s) | 每线程平均吞吐量 |
+| Alloc Elapsed (sec) | 内存分配总耗时（含 zswap 压缩开销） |
+| Wall Elapsed (sec) | 测试总耗时（含分配 + 采样） |
+| User Time (sec) | 用户态 CPU 时间（业务处理） |
+| Sys Time (sec) | 内核态 CPU 时间（含 zswap 压缩开销） |
+
+### CPU 使用率
+
+通过 `/proc/stat` 采样计算系统级 CPU 占比：
+
+| 指标 | 说明 |
+|------|------|
+| CPU User% | 业务处理占比 |
+| CPU Sys% | 压缩/内核开销占比 |
+| CPU Idle% | 空闲占比 |
+
 ## 输出文件
 
 ### 数据文件
 
 | 文件 | 格式 | 内容 |
 |------|------|------|
-| `phase_algo_tN.log` | CSV | 逐秒采样：timestamp, memory_current, swap_current, zswap_stored_pages, zswap_compressed_pages |
-| `zswap_algo_tN_pre.log` | 文本 | 测试前 zswap 快照（kernel params + debug stats + memory info） |
-| `zswap_algo_tN_post.log` | 文本 | 测试后 zswap 快照 |
-| `memtest_algo_tN.log` | 文本 | 测试日志（元数据 + 进度输出） |
+| `phase_algo_tN.log` | CSV | 逐秒采样：timestamp, memory_current, swap_current, zswap_pages, cpu_user/system/idle |
+| `zswap_algo_tN_pre/post.log` | 文本 | 测试前/后 zswap 快照 |
+| `memtest_algo_tN.log` | 文本 | 测试日志（元数据 + METRICS 吞吐量/CPU 指标 + 进度） |
 | `bench_algo_tN.log` | 文本 | llama-bench 输出（可选） |
 | `summary.txt` | 文本 | 汇总报告 |
 
@@ -154,8 +191,11 @@ python3 analyze_results.py ../results/results_*/
 
 | 图表 | 说明 |
 |------|------|
+| `throughput_vs_threads.png` | **各算法总吞吐量随线程数变化** |
+| `time_vs_threads.png` | **分配耗时 + sys_time 随线程数变化（双面板）** |
+| `cpu_breakdown_algo.png` | **CPU 占比堆叠柱状图 (User/ Sys/ Idle)** |
 | `memory_pressure.png` | 各算法 memory/swap 峰值随线程数变化 |
-| `timeseries_algo_tN.png` | 单算法单线程数的 memory+swap 时间线 |
+| `timeseries_algo_tN.png` | 单算法 memory+swap 时间线 |
 | `swap_usage.png` | 各算法 swap 使用量对比 |
 | `compression_ratio.png` | 各算法压缩比柱状图 |
 | `hw_vs_sw_deflate.png` | 硬件 vs 软件 deflate 三面板对比 |

@@ -242,23 +242,21 @@ SWAPFILE_SIZE="16G"                  # swap 文件大小
 THREADS="1 2 4 8 16 32 64 128"      # 线程数梯度
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 压缩算法
 TEST_DURATION=30                     # 每组持续时间(秒)
+MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"  # llama-bench 模型路径
 ```
 
-### 5.3 下载测试模型（如果使用 llama-bench）
+### 5.3 下载 llama-bench 模型
+
+llama-bench 默认启用。需下载 GGUF 格式模型到指定路径：
 
 ```bash
-# 创建模型目录
-mkdir -p /tmp/llama.cpp/models/7B
+mkdir -p /tmp/llama.cpp/models/
 
-# 下载 GGUF 格式模型（示例）
-# 可以从 Hugging Face 下载，例如：
-# wget -O /tmp/llama.cpp/models/7B/m.gguf https://huggingface.co/.../model.gguf
-
-# 配置模型路径（编辑 zswap_benchmark.sh）
-# MODEL="/tmp/llama.cpp/models/7B/m.gguf"
+# 下载 GGUF 模型（例如 Qwen2.5-7B Q4_0 量化）
+# wget -O /tmp/llama.cpp/models/7b-q4_0.gguf <model_url>
 ```
 
-> **注意**: llama-bench 为可选功能，不配置模型时自动使用内存压力测试。
+> 若不下载模型，llama-bench 自动跳过，仅运行内存压力测试并采集吞吐量/CPU 指标。
 
 ---
 
@@ -292,9 +290,16 @@ deflate: 1, 2, 4, 8, 16, 32, 64, 128 threads (硬件加速)
 [INFO] 内存压力测试: algo=lz4, threads=64, 总负载=16384MB
 [INFO]   cgroup memory.high=16384MB, swap=16384MB
 [INFO]   预期阶段: zswap 压缩
-  [1/30s] memory.current=15234MB, swap.current=0MB
-  [2/30s] memory.current=16345MB, swap.current=234MB
+METRICS:total_throughput_kbps=12345678.90
+METRICS:avg_throughput_kbps=192896.23
+METRICS:alloc_elapsed_sec=2.1456
+  [1/30s] memory=15234MB, swap=0MB
+  [2/30s] memory=16345MB, swap=234MB
   ...
+METRICS:user_time_sec=1.2345
+METRICS:sys_time_sec=5.6789
+METRICS:cpu_user_pct=35.20
+METRICS:cpu_sys_pct=45.30
 ```
 
 ### 6.3 快速验证测试（可选）
@@ -346,12 +351,15 @@ python3 analyze_results.py ../results/results_*/
 
 | 图表 | 说明 |
 |------|------|
+| `throughput_vs_threads.png` | **各算法总吞吐量 (KB/s) 随线程数变化** |
+| `time_vs_threads.png` | **分配耗时 + 内核时间 (sys_time) 随线程数变化** |
+| `cpu_breakdown_algo.png` | **CPU 占比堆叠柱状图 (User业务/ Sys压缩/ Idle)** |
 | `memory_pressure.png` | 各算法 memory/swap 峰值随线程数变化 |
-| `timeseries_algo_tN.png` | 单算法的 memory+swap 时间线（有 swap 活动的线程数） |
+| `timeseries_algo_tN.png` | 单算法 memory+swap 时间线 |
 | `swap_usage.png` | 各算法 swap 使用量对比 |
 | `compression_ratio.png` | 各算法压缩比柱状图 |
-| `hw_vs_sw_deflate.png` | 硬件 vs 软件 deflate 三面板对比（memory/swap/compression） |
-| `all_algos_t128_timeline.png` | 所有算法最高线程数 memory+swap 时间线对比 |
+| `hw_vs_sw_deflate.png` | 硬件 vs 软件 deflate 三面板对比 |
+| `all_algos_t128_timeline.png` | 所有算法最高线程数 memory+swap 时间线 |
 
 ### 7.4 分析输出文件
 
