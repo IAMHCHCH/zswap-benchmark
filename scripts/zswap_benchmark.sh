@@ -12,8 +12,7 @@ set -e
 
 # ========== 配置参数 ==========
 PER_THREAD_MEM="256M"                # 每线程分配内存
-CGROUP_MEM_HIGH="16G"                # cgroup memory.high (软节流阈值)
-CGROUP_MEM_MAX="24G"                 # cgroup memory.max (硬限制, 约为 HIGH 的 1.5 倍)
+CGROUP_MEM_HIGH="16G"                # cgroup memory.high (软节流阈值, 不设 max 避免 OOM)
 SWAPFILE_SIZE="16G"                  # swap 文件大小
 SWAPFILE="/swapfile"                 # swap 文件路径
 SWAP_PRIORITY=100                    # swap 优先级
@@ -174,7 +173,7 @@ prepare_swap() {
 
 # ========== cgroup v2 初始化 ==========
 setup_cgroup() {
-    log_info "初始化 cgroup v2 (memory.high=$CGROUP_MEM_HIGH, memory.max=$CGROUP_MEM_MAX)..."
+    log_info "初始化 cgroup v2 (memory.high=$CGROUP_MEM_HIGH, memory.max=max)..."
 
     # 检查 cgroup v2 是否可用
     if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
@@ -203,14 +202,17 @@ setup_cgroup() {
     echo $$ > "$CGROUP_DIR/cgroup.procs"
 
     # 设置内存限制
-    echo "$CGROUP_MEM_MAX" > "$CGROUP_DIR/memory.max"
+    # memory.max 保持 "max" 不设硬限制, 避免 OOM killer 杀进程
+    # 当 swap 空间耗尽后, 新的内存分配会在 page fault 处阻塞 (throttle),
+    # 直到已有页面被回收释放, 但进程不会被 kill
+    echo "max" > "$CGROUP_DIR/memory.max"
     echo "$CGROUP_MEM_HIGH" > "$CGROUP_DIR/memory.high"
 
     # 限制 swap 用量 (等于 swapfile 大小, 可观察满载)
     echo "$SWAPFILE_SIZE" > "$CGROUP_DIR/memory.swap.max"
 
     log_info "cgroup v2 创建完成:"
-    log_info "  memory.max   = $(cat $CGROUP_DIR/memory.max)"
+    log_info "  memory.max   = $(cat $CGROUP_DIR/memory.max) (不设硬限制, 避免 OOM)"
     log_info "  memory.high  = $(cat $CGROUP_DIR/memory.high)"
     log_info "  memory.swap.max = $(cat $CGROUP_DIR/memory.swap.max)"
 }
@@ -712,7 +714,7 @@ generate_summary() {
         echo "CPU:          $(grep 'Model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
         echo "Memory:       $(grep MemTotal /proc/meminfo | awk '{print $2" kB"}')"
         echo "Cgroup High:  $CGROUP_MEM_HIGH"
-        echo "Cgroup Max:   $CGROUP_MEM_MAX"
+        echo "Cgroup Max:   max (不设硬限制)"
         echo "Swapfile:     $SWAPFILE ($SWAPFILE_SIZE, priority=$SWAP_PRIORITY)"
         echo "Per-Thread:   $PER_THREAD_MEM"
         echo "Test Duration: ${TEST_DURATION}s"
