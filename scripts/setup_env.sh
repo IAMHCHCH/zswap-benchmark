@@ -248,14 +248,14 @@ fi
 
 # 验证
 echo "  已加载的压缩算法:"
-for algo in lz4 lzo lzo-rle zstd; do
+for algo in lz4 lzo lzo-rle zstd deflate; do
     count=$(grep -c "name.*:.*${algo}" /proc/crypto 2>/dev/null || echo "0")
     if [ "$count" -gt 0 ]; then
-        # 检查是否有硬件加速版本
         hw_drv=""
         case $algo in
-            lz4)  hw_drv="hisi-lz4-acomp" ;;
-            zstd) hw_drv="hisi-zstd-acomp" ;;
+            deflate) hw_drv="hisi-deflate-acomp" ;;
+            lz4)     hw_drv="hisi-lz4-acomp" ;;
+            zstd)    hw_drv="hisi-zstd-acomp" ;;
         esac
         if [ -n "$hw_drv" ] && grep -q "$hw_drv" /proc/crypto 2>/dev/null; then
             echo "    ✓ $algo ($count instances, 含硬件加速 $hw_drv)"
