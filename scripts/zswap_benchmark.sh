@@ -14,7 +14,7 @@ set -e
 # ========== 配置参数 ==========
 MEM_LIMIT="4G"                      # 内存限制
 THREADS="1 2 4 8 16 32 64 128"     # 线程数 (适配鲲鹏920 128核)
-ALGOS="lz4 lzo zstd"                # 压缩算法
+ALGOS="lz4 lzo"                      # 压缩算法 (zstd 硬件加速暂不可用, 待 hisi-zstd-acomp 就绪后加回)
 MODEL=""                            # 测试模型路径 (留空则跳过 llama-bench)
 PROMPT_LEN=512                       # prompt 长度
 GEN_LEN=128                          # 生成长度
