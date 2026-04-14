@@ -159,11 +159,6 @@ if $CGROUP_V2_READY; then
     mkdir -p "$CGROUP_DIR"
     echo "    ✓ cgroup 目录已创建: $CGROUP_DIR"
 
-    # 在子 cgroup 中启用 memory 控制器（供更深层级使用）
-    if [ -f "$CGROUP_DIR/cgroup.subtree_control" ]; then
-        echo "+memory" > "$CGROUP_DIR/cgroup.subtree_control" 2>/dev/null || true
-    fi
-
     # 设置内存限制 (与 zswap_benchmark.sh 保持一致)
     MEM_LIMIT_SETUP="4G"
     echo "$MEM_LIMIT_SETUP" > "$CGROUP_DIR/memory.max" 2>/dev/null || \
