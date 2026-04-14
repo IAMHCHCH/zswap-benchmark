@@ -14,7 +14,7 @@ set -e
 # ========== 配置参数 ==========
 MEM_LIMIT="4G"                      # 内存限制
 THREADS="1 2 4 8 16 32 64 128"     # 线程数 (适配鲲鹏920 128核)
-ALGOS="deflate lzo"                    # 压缩算法 (deflate 使用 hisi-deflate-acomp 硬件加速; lz4/zstd 硬件加速暂不可用)
+ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 硬件deflate(hisi-deflate-acomp)
 MODEL=""                            # 测试模型路径 (留空则跳过 llama-bench)
 PROMPT_LEN=512                       # prompt 长度
 GEN_LEN=128                          # 生成长度
@@ -159,9 +159,19 @@ setup_cgroup() {
 }
 
 # 配置 zswap
+# algo 参数可以是: lz4, lzo, zstd, deflate, deflate-sw
+# deflate-sw 表示强制使用软件 deflate (卸载 hisi_zip)
 configure_zswap() {
     local algo=$1
-    log_info "配置 zswap: 算法=$algo"
+    local display_algo="$algo"
+
+    # deflate-sw 内部使用 deflate 算法但卸载硬件加速器
+    if [ "$algo" = "deflate-sw" ]; then
+        algo="deflate"
+        log_info "配置 zswap: 算法=deflate (强制软件实现)"
+    else
+        log_info "配置 zswap: 算法=$algo"
+    fi
 
     # 检查 zswap 是否可用
     if [ ! -d /sys/module/zswap ]; then
@@ -189,9 +199,10 @@ configure_zswap() {
             ;;
     esac
 
-    # 硬件加速 (HiSilicon ZIP, 支持 deflate/lz4/zstd, 不支持 lzo)
-    if [ "$algo" != "lzo" ]; then
-        rmmod hisi_zip 2>/dev/null || true
+    # 控制硬件加速器: 仅在测试 "deflate"(非 sw) 时加载 hisi_zip
+    # 其他算法 (lz4/lzo/zstd/deflate-sw) 均卸载 hisi_zip 以确保使用纯软件实现
+    rmmod hisi_zip 2>/dev/null || true
+    if [ "$display_algo" = "deflate" ]; then
         modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
     fi
 
@@ -209,20 +220,23 @@ configure_zswap() {
     local current_algo=$(cat /sys/module/zswap/parameters/compressor)
     local current_enabled=$(cat /sys/module/zswap/parameters/enabled)
 
-    # 检查当前算法是否使用了硬件加速
+    # 检查当前算法的实际实现方式
     local hw_status="软件"
-    case $algo in
+    case $display_algo in
         deflate)
-            grep -q "hisi-deflate-acomp" /proc/crypto 2>/dev/null && hw_status="硬件(hisi_zip)"
+            grep -q "hisi-deflate-acomp" /proc/crypto 2>/dev/null && hw_status="硬件(hisi-deflate-acomp)"
+            ;;
+        deflate-sw)
+            hw_status="软件(deflate)"
             ;;
         lz4)
-            grep -q "hisi-lz4-acomp" /proc/crypto 2>/dev/null && hw_status="硬件(hisi_zip)"
-            ;;
-        zstd)
-            grep -q "hisi-zstd-acomp" /proc/crypto 2>/dev/null && hw_status="硬件(hisi_zip)"
+            hw_status="软件(lz4)"
             ;;
         lzo)
-            hw_status="软件(lzo 不支持硬件加速)"
+            hw_status="软件(lzo)"
+            ;;
+        zstd)
+            hw_status="软件(zstd)"
             ;;
     esac
     log_info "zswap 配置: enabled=$current_enabled, compressor=$current_algo, 实现=$hw_status"
