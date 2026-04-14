@@ -212,19 +212,56 @@ fi
 echo ""
 echo "[5/6] 加载压缩算法模块..."
 
-# 加载 lz4 模块（如果是模块方式编译）
-modprobe lz4 2>/dev/null || echo "  lz4 可能已内置或不可用"
-modprobe lz4_compress 2>/dev/null || true
+# 软件压缩算法
+modprobe lz4 2>/dev/null || true
+modprobe lzo 2>/dev/null || true
+modprobe zstd 2>/dev/null || true
 
-# 加载 zstd 模块
-modprobe zstd 2>/dev/null || echo "  zstd 可能已内置"
+# HiSilicon ZIP 硬件加速器 (鲲鹏920, 支持 lz4/zstd 硬件加速, 不支持 lzo)
+# uacc_mode=1: 启用用户态加速框架; pf_q_num=256: 增加队列深度提升吞吐
+rmmod hisi_zip 2>/dev/null || true
+if modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null; then
+    echo "  ✓ HiSilicon ZIP 硬件加速器已加载 (uacc_mode=1, pf_q_num=256)"
+
+    # 打印 ZIP 设备 NUMA 拓扑
+    echo "  ZIP 设备 NUMA 拓扑:"
+    for dev in /sys/class/uacce/hisi_zip-*/device; do
+        if [ -d "$dev" ]; then
+            dev_name=$(basename $(readlink -f "$dev/.."))
+            node_id_file="$(dirname $(readlink -f "$dev/.."))/../node_id"
+            # 尝试从 uacce 接口获取 node_id
+            uacce_dev=$(echo "$dev" | sed 's|/device$||')
+            node_id=""
+            if [ -f "$uacce_dev/node_id" ]; then
+                node_id=$(cat "$uacce_dev/node_id" 2>/dev/null)
+            fi
+            if [ -n "$node_id" ]; then
+                echo "    $dev_name -> NUMA node $node_id"
+            else
+                echo "    $dev_name -> NUMA node (未知)"
+            fi
+        fi
+    done
+else
+    echo "  hisi_zip 不可用, 将使用软件压缩"
+fi
 
 # 验证
 echo "  已加载的压缩算法:"
 for algo in lz4 lzo lzo-rle zstd; do
     count=$(grep -c "name.*:.*${algo}" /proc/crypto 2>/dev/null || echo "0")
     if [ "$count" -gt 0 ]; then
-        echo "    ✓ $algo ($count instances)"
+        # 检查是否有硬件加速版本
+        hw_drv=""
+        case $algo in
+            lz4)  hw_drv="hisi-lz4-acomp" ;;
+            zstd) hw_drv="hisi-zstd-acomp" ;;
+        esac
+        if [ -n "$hw_drv" ] && grep -q "$hw_drv" /proc/crypto 2>/dev/null; then
+            echo "    ✓ $algo ($count instances, 含硬件加速 $hw_drv)"
+        else
+            echo "    ✓ $algo ($count instances)"
+        fi
     fi
 done
 
