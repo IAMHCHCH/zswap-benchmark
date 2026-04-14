@@ -1,20 +1,26 @@
 #!/bin/bash
 #
 # zswap_benchmark.sh - Zswap 性能测试主脚本
-# 对比 lz4/lzo/zstd 在不同线程数下的性能表现
+# 对比 lz4/deflate-sw/lzo/zstd/deflate 在不同线程数下的性能表现
 # 适配 openEuler 24.03 (LTS-SP2) aarch64 + 鲲鹏920 环境
 #
-# 硬件加速: HiSilicon ZIP (hisi_zip) 支持 lz4/zstd 硬件压缩
-#   - 内核模块: hisi_zip (PCI device 0xa250)
-#   - 优先级 300，自动优先选择硬件，不可用时回退软件实现
+# 测试模型: 每线程固定分配 256MB，随线程增长自然打满 cgroup → 触发 zswap → 打满 swap → OOM
+# 三个阶段: 无 swap → zswap 压缩 → swap 满载
 #
 
 set -e
 
 # ========== 配置参数 ==========
-MEM_LIMIT="4G"                      # 内存限制
-THREADS="1 2 4 8 16 32 64 128"     # 线程数 (适配鲲鹏920 128核)
+PER_THREAD_MEM="256M"                # 每线程分配内存
+CGROUP_MEM_HIGH="16G"                # cgroup memory.high (软节流阈值)
+CGROUP_MEM_MAX="24G"                 # cgroup memory.max (硬限制, 约为 HIGH 的 1.5 倍)
+SWAPFILE_SIZE="16G"                  # swap 文件大小
+SWAPFILE="/swapfile"                 # swap 文件路径
+SWAP_PRIORITY=100                    # swap 优先级
+THREADS="1 2 4 8 16 32 64 128"      # 线程数 (适配鲲鹏920 128核)
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 硬件deflate(hisi-deflate-acomp)
+TEST_DURATION=30                     # 每组测试持续时间 (秒)
+SAMPLE_INTERVAL=1                    # 采样间隔 (秒)
 MODEL=""                            # 测试模型路径 (留空则跳过 llama-bench)
 PROMPT_LEN=512                       # prompt 长度
 GEN_LEN=128                          # 生成长度
@@ -33,21 +39,36 @@ NC='\033[0m'
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_err() { echo -e "${RED}[ERROR]${NC} $1"; }
-log_hw()  { echo -e "${CYAN}[HW]${NC} $1"; }
+log_err()  { echo -e "${RED}[ERROR]${NC} $1"; }
+log_hw()   { echo -e "${CYAN}[HW]${NC} $1"; }
 
-# 检查依赖
+# 将带单位的内存字符串转换为字节数
+mem_to_bytes() {
+    local val="$1"
+    local num="${val%[KkMmGg]}"
+    local unit="${val##*[0-9]}"
+    case "$unit" in
+        G|g) echo "$((num * 1024 * 1024 * 1024))" ;;
+        M|m) echo "$((num * 1024 * 1024))" ;;
+        K|k) echo "$((num * 1024))" ;;
+        *)   echo "$num" ;;
+    esac
+}
+
+# ========== 依赖检查 ==========
 check_dependencies() {
     log_info "检查依赖..."
 
-    local deps=("bc" "awk")
+    local deps=("bc" "awk" "python3" "numactl")
     for dep in "${deps[@]}"; do
         if ! command -v $dep &> /dev/null; then
-            log_warn "缺少依赖: $dep"
+            log_err "缺少依赖: $dep"
+            log_err "请运行: sudo yum install -y $dep"
+            exit 1
         fi
     done
 
-    # 检查 llama-bench
+    # 检查 llama-bench (可选)
     if [ -n "$MODEL" ] && [ -f "$MODEL" ]; then
         if command -v llama-bench &> /dev/null; then
             LLAMA_BENCH_AVAILABLE=1
@@ -57,12 +78,12 @@ check_dependencies() {
             LLAMA_BENCH_AVAILABLE=0
         fi
     else
-        log_info "未配置模型文件, 将使用内存压力测试 (stress-ng)"
+        log_info "未配置模型文件, 使用内存压力测试"
         LLAMA_BENCH_AVAILABLE=0
     fi
 }
 
-# 检测硬件加速器
+# ========== 硬件加速器检测 ==========
 detect_hw_accelerator() {
     log_info "检测 HiSilicon ZIP 硬件加速器..."
 
@@ -70,11 +91,13 @@ detect_hw_accelerator() {
     rmmod hisi_zip 2>/dev/null || true
     modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
 
+    HW_ACCEL_AVAILABLE=0
+    ZIP_NUMA_NODE=""
+
     if lsmod | grep -q hisi_zip; then
         log_hw "HiSilicon ZIP 已加载 (uacc_mode=1, pf_q_num=256)"
 
         # 发现 ZIP 设备的 NUMA 拓扑
-        ZIP_NUMA_MAP=""
         local dev_idx=0
         for uacce in /sys/class/uacce/hisi_zip-*; do
             if [ -d "$uacce" ]; then
@@ -85,7 +108,10 @@ detect_hw_accelerator() {
                 fi
                 if [ -n "$node_id" ]; then
                     log_hw "  $dev_name -> NUMA node $node_id"
-                    ZIP_NUMA_MAP="$ZIP_NUMA_MAP $dev_name:$node_id"
+                    # 取第一个设备的 NUMA node
+                    if [ -z "$ZIP_NUMA_NODE" ]; then
+                        ZIP_NUMA_NODE="$node_id"
+                    fi
                 else
                     log_hw "  $dev_name -> NUMA node (未知)"
                 fi
@@ -93,20 +119,13 @@ detect_hw_accelerator() {
             fi
         done
 
-        # 检查每个算法的硬件支持
-        for algo in $ALGOS; do
-            local drv_name=""
-            case $algo in
-                deflate) drv_name="hisi-deflate-acomp" ;;
-                lz4)     drv_name="hisi-lz4-acomp" ;;
-                zstd)    drv_name="hisi-zstd-acomp" ;;
-            esac
-            if [ -n "$drv_name" ] && grep -q "$drv_name" /proc/crypto 2>/dev/null; then
-                log_hw "  $algo: 硬件加速可用 ($drv_name, priority 300)"
-            else
-                log_info "  $algo: 使用软件实现"
-            fi
-        done
+        # 检查 deflate 硬件支持
+        if grep -q "hisi-deflate-acomp" /proc/crypto 2>/dev/null; then
+            log_hw "  deflate: 硬件加速可用 (hisi-deflate-acomp, priority 300)"
+            HW_ACCEL_AVAILABLE=1
+        else
+            log_info "  deflate: 硬件加速不可用"
+        fi
 
         # 打印系统 NUMA 拓扑摘要
         if command -v numactl &> /dev/null; then
@@ -118,9 +137,41 @@ detect_hw_accelerator() {
     fi
 }
 
-# 初始化 cgroup v2
+# ========== Swap 准备 ==========
+prepare_swap() {
+    log_info "准备 swap 环境..."
+
+    # 关闭所有现有 swap
+    swapoff -a 2>/dev/null || true
+    log_info "已关闭所有现有 swap"
+
+    # 清理旧 swapfile
+    if [ -f "$SWAPFILE" ]; then
+        swapoff "$SWAPFILE" 2>/dev/null || true
+        rm -f "$SWAPFILE"
+        log_info "已清理旧 swapfile: $SWAPFILE"
+    fi
+
+    # 创建 swapfile
+    fallocate -l "$SWAPFILE_SIZE" "$SWAPFILE"
+    chmod 600 "$SWAPFILE"
+    mkswap "$SWAPFILE" > /dev/null
+    swapon "$SWAPFILE" -p "$SWAP_PRIORITY"
+    log_info "swapfile 已创建并启用: $SWAPFILE ($SWAPFILE_SIZE, priority=$SWAP_PRIORITY)"
+
+    # 验证
+    local swap_info=$(swapon --show=NAME,SIZE,PRIO --noheadings 2>/dev/null | grep "$SWAPFILE")
+    if [ -n "$swap_info" ]; then
+        log_info "swap 验证: $swap_info"
+    else
+        log_err "swap 启用失败!"
+        exit 1
+    fi
+}
+
+# ========== cgroup v2 初始化 ==========
 setup_cgroup() {
-    log_info "初始化 cgroup v2 (内存限制: $MEM_LIMIT)..."
+    log_info "初始化 cgroup v2 (memory.high=$CGROUP_MEM_HIGH, memory.max=$CGROUP_MEM_MAX)..."
 
     # 检查 cgroup v2 是否可用
     if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
@@ -148,19 +199,20 @@ setup_cgroup() {
     # 将当前进程加入 cgroup
     echo $$ > "$CGROUP_DIR/cgroup.procs"
 
-    # 设置内存限制 (cgroup v2 接口)
-    echo "$MEM_LIMIT" > "$CGROUP_DIR/memory.max"
-    echo "$MEM_LIMIT" > "$CGROUP_DIR/memory.high"
+    # 设置内存限制
+    echo "$CGROUP_MEM_MAX" > "$CGROUP_DIR/memory.max"
+    echo "$CGROUP_MEM_HIGH" > "$CGROUP_DIR/memory.high"
 
-    # 启用 swap (不限制 swap 上限, 让 zswap 尽可能工作)
-    echo "max" > "$CGROUP_DIR/memory.swap.max"
+    # 限制 swap 用量 (等于 swapfile 大小, 可观察满载)
+    echo "$SWAPFILE_SIZE" > "$CGROUP_DIR/memory.swap.max"
 
-    log_info "cgroup v2 创建完成"
+    log_info "cgroup v2 创建完成:"
+    log_info "  memory.max   = $(cat $CGROUP_DIR/memory.max)"
+    log_info "  memory.high  = $(cat $CGROUP_DIR/memory.high)"
+    log_info "  memory.swap.max = $(cat $CGROUP_DIR/memory.swap.max)"
 }
 
-# 配置 zswap
-# algo 参数可以是: lz4, lzo, zstd, deflate, deflate-sw
-# deflate-sw 表示强制使用软件 deflate (卸载 hisi_zip)
+# ========== Zswap 配置 ==========
 configure_zswap() {
     local algo=$1
     local display_algo="$algo"
@@ -176,31 +228,20 @@ configure_zswap() {
     # 检查 zswap 是否可用
     if [ ! -d /sys/module/zswap ]; then
         log_err "zswap 模块未加载!"
-        log_err "请确保使用支持 zswap 的内核, 并检查:"
-        log_err "  - 内核配置: CONFIG_ZSWAP=y"
-        log_err "  - 当前内核: $(uname -r)"
-        log_err "  - 运行 setup_env.sh 进行环境检查"
+        log_err "请确保使用支持 zswap 的内核 (CONFIG_ZSWAP=y)"
         exit 1
     fi
 
     # 加载压缩算法的内核模块
     case $algo in
-        lz4)
-            modprobe lz4 2>/dev/null || true
-            ;;
-        lzo)
-            modprobe lzo 2>/dev/null || true
-            ;;
-        zstd)
-            modprobe zstd 2>/dev/null || true
-            ;;
-        deflate)
-            modprobe deflate 2>/dev/null || true
-            ;;
+        lz4)     modprobe lz4 2>/dev/null || true ;;
+        lzo)     modprobe lzo 2>/dev/null || true ;;
+        zstd)    modprobe zstd 2>/dev/null || true ;;
+        deflate) modprobe deflate 2>/dev/null || true ;;
     esac
 
     # 控制硬件加速器: 仅在测试 "deflate"(非 sw) 时加载 hisi_zip
-    # 其他算法 (lz4/lzo/zstd/deflate-sw) 均卸载 hisi_zip 以确保使用纯软件实现
+    # 其他算法均卸载 hisi_zip 以确保使用纯软件实现
     rmmod hisi_zip 2>/dev/null || true
     if [ "$display_algo" = "deflate" ]; then
         modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
@@ -220,45 +261,38 @@ configure_zswap() {
     local current_algo=$(cat /sys/module/zswap/parameters/compressor)
     local current_enabled=$(cat /sys/module/zswap/parameters/enabled)
 
-    # 检查当前算法的实际实现方式
     local hw_status="软件"
     case $display_algo in
         deflate)
             grep -q "hisi-deflate-acomp" /proc/crypto 2>/dev/null && hw_status="硬件(hisi-deflate-acomp)"
             ;;
-        deflate-sw)
-            hw_status="软件(deflate)"
-            ;;
-        lz4)
-            hw_status="软件(lz4)"
-            ;;
-        lzo)
-            hw_status="软件(lzo)"
-            ;;
-        zstd)
-            hw_status="软件(zstd)"
-            ;;
+        deflate-sw) hw_status="软件(deflate)" ;;
+        lz4)        hw_status="软件(lz4)" ;;
+        lzo)        hw_status="软件(lzo)" ;;
+        zstd)       hw_status="软件(zstd)" ;;
     esac
     log_info "zswap 配置: enabled=$current_enabled, compressor=$current_algo, 实现=$hw_status"
 
     sleep 1
 }
 
-# 收集 zswap 统计
+# ========== 采集 zswap 统计 ==========
 collect_zswap_stats() {
     local algo=$1
     local threads=$2
-    local outfile="$RESULT_DIR/zswap_${algo}_t${threads}.log"
+    local tag=$3  # "pre" or "post"
+    local outfile="$RESULT_DIR/zswap_${algo}_t${threads}_${tag}.log"
 
     {
-        echo "=== Zswap Configuration ==="
+        echo "=== Zswap Stats ($tag) ==="
         echo "Algorithm: $algo"
         echo "Threads: $threads"
-        echo "Memory Limit: $MEM_LIMIT"
-        echo "Timestamp: $(date)"
+        echo "Timestamp: $(date +%s.%N)"
         echo ""
         echo "=== Kernel Parameters ==="
-        paste -d= /sys/module/zswap/parameters/* 2>/dev/null || echo "Cannot read params"
+        for p in /sys/module/zswap/parameters/*; do
+            echo "$(basename $p)=$(cat $p 2>/dev/null)"
+        done
         echo ""
         echo "=== Zswap Debug Info ==="
         cat /sys/kernel/debug/zswap/* 2>/dev/null || echo "Cannot read debug info"
@@ -266,12 +300,197 @@ collect_zswap_stats() {
         echo "=== Memory Info ==="
         grep -E "MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree|Zswap" /proc/meminfo
         echo ""
-        echo "=== Crypto Implementation ==="
-        grep -A3 "name.*:.*${algo}" /proc/crypto 2>/dev/null || echo "Cannot read crypto info"
+        echo "=== cgroup Memory ==="
+        echo "memory.current=$(cat $CGROUP_DIR/memory.current 2>/dev/null)"
+        echo "memory.swap.current=$(cat $CGROUP_DIR/memory.swap.current 2>/dev/null)"
+        echo "memory.high=$(cat $CGROUP_DIR/memory.high 2>/dev/null)"
+        echo "memory.max=$(cat $CGROUP_DIR/memory.max 2>/dev/null)"
     } >> "$outfile"
 }
 
-# 运行 llama.cpp 基准测试
+# ========== 内存压力测试 (核心) ==========
+# 每线程分配 PER_THREAD_MEM 匿名内存, 逐秒采样 cgroup/zswap 指标
+run_memtest() {
+    local algo=$1
+    local threads=$2
+    local outfile="$RESULT_DIR/memtest_${algo}_t${threads}.log"
+    local phasefile="$RESULT_DIR/phase_${algo}_t${threads}.log"
+
+    local per_thread_bytes=$(mem_to_bytes "$PER_THREAD_MEM")
+    local total_mem_bytes=$((per_thread_bytes * threads))
+    local total_mem_mb=$((total_mem_bytes / 1024 / 1024))
+    local cgroup_high_mb=$(($(mem_to_bytes "$CGROUP_MEM_HIGH") / 1024 / 1024))
+    local swap_size_mb=$(($(mem_to_bytes "$SWAPFILE_SIZE") / 1024 / 1024))
+
+    log_info "内存压力测试: algo=$algo, threads=$threads, 总负载=${total_mem_mb}MB"
+    log_info "  cgroup memory.high=${cgroup_high_mb}MB, swap=${swap_size_mb}MB"
+
+    # 判断预期阶段
+    local expected_phase="无 swap"
+    if [ "$total_mem_bytes" -ge "$(mem_to_bytes "$CGROUP_MEM_HIGH")" ]; then
+        expected_phase="zswap 压缩"
+    fi
+    local total_capacity=$(($(mem_to_bytes "$CGROUP_MEM_HIGH") + $(mem_to_bytes "$SWAPFILE_SIZE")))
+    if [ "$total_mem_bytes" -ge "$total_capacity" ]; then
+        expected_phase="swap 满载/OOM"
+    fi
+    log_info "  预期阶段: $expected_phase"
+
+    # 确定 NUMA 绑定策略
+    local numa_prefix=""
+    if [ "$algo" = "deflate" ] && [ -n "$ZIP_NUMA_NODE" ]; then
+        # 硬件 deflate: 绑定到 ZIP 设备所在 NUMA node
+        numa_prefix="numactl --cpunodebind=$ZIP_NUMA_NODE --membind=$ZIP_NUMA_NODE"
+        log_info "  NUMA 亲和: 绑定到 node $ZIP_NUMA_NODE (ZIP 设备所在 node)"
+    fi
+
+    # 确保 cgroup 任务在组内
+    echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
+
+    # 写入测试头信息
+    {
+        echo "=== Memory Stress Test ==="
+        echo "Algorithm: $algo"
+        echo "Threads: $threads"
+        echo "Per_Thread_Mem: $PER_THREAD_MEM ($per_thread_bytes bytes)"
+        echo "Total_Mem: ${total_mem_mb}MB"
+        echo "Cgroup_High: ${cgroup_high_mb}MB"
+        echo "Swap_Size: ${swap_size_mb}MB"
+        echo "Expected_Phase: $expected_phase"
+        echo "NUMA_Policy: $numa_prefix"
+        echo "Duration: ${TEST_DURATION}s"
+        echo "Timestamp: $(date)"
+        echo ""
+    } > "$outfile"
+
+    # 写入采样 CSV 头
+    echo "timestamp,memory_current,swap_current,zswap_stored_pages,zswap_compressed_pages" > "$phasefile"
+
+    # 采集 zswap 测试前快照
+    collect_zswap_stats "$algo" "$threads" "pre"
+
+    # 记录启动时间
+    local start_ts=$(date +%s)
+
+    # 启动 N 个子进程, 每个分配 per_thread_bytes 匿名内存
+    $numa_prefix python3 -c "
+import mmap, time, os, sys
+
+per_thread = $per_thread_bytes
+n_threads = $threads
+duration = $TEST_DURATION
+
+# 检查 cgroup 是否可用
+cgroup_dir = '$CGROUP_DIR'
+cgroup_procs = os.path.join(cgroup_dir, 'cgroup.procs')
+
+pids = []
+for i in range(n_threads):
+    pid = os.fork()
+    if pid == 0:
+        # 子进程: 分配内存并持有
+        try:
+            buf = mmap.mmap(-1, per_thread)
+            # 写入数据触发物理页分配 (每页 4KB 写一个字节)
+            page_size = 4096
+            for offset in range(0, per_thread, page_size):
+                buf[offset] = 0xAA
+            # 持有内存直到父进程通知退出
+            while True:
+                time.sleep(1)
+        except Exception as e:
+            print(f'Child {i} error: {e}', file=sys.stderr)
+            os._exit(1)
+    else:
+        pids.append(pid)
+
+# 等待所有子进程完成内存分配
+time.sleep(3)
+
+# 子进程自动继承父进程的 cgroup
+
+# 采样循环
+try:
+    for sec in range(duration):
+        ts = time.time()
+
+        # 读取 cgroup 指标
+        try:
+            with open(os.path.join(cgroup_dir, 'memory.current')) as f:
+                mem_current = f.read().strip()
+        except:
+            mem_current = '0'
+
+        try:
+            with open(os.path.join(cgroup_dir, 'memory.swap.current')) as f:
+                swap_current = f.read().strip()
+        except:
+            swap_current = '0'
+
+        # 读取 zswap 指标
+        stored_pages = '0'
+        compressed_pages = '0'
+        try:
+            with open('/sys/kernel/debug/zswap/stored_pages') as f:
+                stored_pages = f.read().strip()
+        except:
+            pass
+        try:
+            with open('/sys/kernel/debug/zswap/compressed_pages') as f:
+                compressed_pages = f.read().strip()
+        except:
+            pass
+
+        # 输出 CSV 行 (追加到 phasefile)
+        with open('$phasefile', 'a') as f:
+            f.write(f'{ts:.2f},{mem_current},{swap_current},{stored_pages},{compressed_pages}\n')
+
+        # 输出进度
+        mem_mb = int(mem_current) // (1024*1024) if mem_current.isdigit() else 0
+        swap_mb = int(swap_current) // (1024*1024) if swap_current.isdigit() else 0
+        print(f'  [{sec+1}/{duration}s] memory.current={mem_mb}MB, swap.current={swap_mb}MB', flush=True)
+
+        time.sleep($SAMPLE_INTERVAL)
+
+except KeyboardInterrupt:
+    pass
+
+# 终止所有子进程
+for pid in pids:
+    try:
+        os.kill(pid, 9)
+    except:
+        pass
+
+# 等待子进程退出
+for pid in pids:
+    try:
+        os.waitpid(pid, 0)
+    except:
+        pass
+
+print('All children terminated.')
+" 2>&1 | tee -a "$outfile"
+
+    local end_ts=$(date +%s)
+    local elapsed=$((end_ts - start_ts))
+
+    # 采集 zswap 测试后快照
+    collect_zswap_stats "$algo" "$threads" "post"
+
+    # 提取关键指标写入测试日志
+    {
+        echo ""
+        echo "=== Test Summary ==="
+        echo "Elapsed: ${elapsed}s"
+        echo "Total_Mem_Loaded: ${total_mem_mb}MB"
+        echo "Expected_Phase: $expected_phase"
+    } >> "$outfile"
+
+    log_info "内存压力测试完成: algo=$algo, threads=$threads, 耗时=${elapsed}s"
+}
+
+# ========== llama.cpp 基准测试 (可选) ==========
 run_llama_bench() {
     local algo=$1
     local threads=$2
@@ -283,14 +502,13 @@ run_llama_bench() {
 
     log_info "运行 llama-bench: algo=$algo, threads=$threads"
 
-    # 确保 cgroup 任务在组内
-    echo $$ > "$CGROUP_DIR/cgroup.procs"
+    echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
 
     {
         echo "=== Llama Benchmark ==="
         echo "Algorithm: $algo"
         echo "Threads: $threads"
-        echo "Memory Limit: $MEM_LIMIT"
+        echo "Memory Limit: $CGROUP_MEM_HIGH"
         echo "Model: $MODEL"
         echo "Prompt Length: $PROMPT_LEN"
         echo "Generate Length: $GEN_LEN"
@@ -310,86 +528,27 @@ run_llama_bench() {
         2>&1 | tee -a "$outfile"
 }
 
-# 运行内存压力测试 (无 llama-bench 时)
-run_memtest() {
-    local algo=$1
-    local threads=$2
-    local outfile="$RESULT_DIR/memtest_${algo}_t${threads}.log"
-
-    log_info "运行内存压力测试: algo=$algo, threads=$threads"
-
-    echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
-
-    # 根据 ZIP 设备 NUMA 拓扑选择最优 node
-    # 对于多 socket 鲲鹏920, 选择与 ZIP 设备相同的 NUMA node 可获得最佳性能
-    local numa_opt=""
-    if [ -n "$ZIP_NUMA_MAP" ]; then
-        # 取第一个 ZIP 设备的 node id
-        local first_entry=$(echo $ZIP_NUMA_MAP | awk '{print $1}')
-        local zip_node=$(echo "$first_entry" | cut -d: -f2)
-        if [ -n "$zip_node" ] && command -v numactl &> /dev/null; then
-            numa_opt="numactl --cpunodebind=$zip_node --membind=$zip_node"
-            log_info "  NUMA 亲和: 绑定到 node $zip_node (ZIP 设备所在 node)"
-        fi
-    fi
-
-    if command -v stress-ng &> /dev/null; then
-        {
-            echo "=== Memory Stress Test (stress-ng) ==="
-            echo "Algorithm: $algo"
-            echo "Threads: $threads"
-            echo "Memory Limit: $MEM_LIMIT"
-            [ -n "$numa_opt" ] && echo "NUMA binding: $numa_opt"
-            echo ""
-        } >> "$outfile"
-
-        $numa_opt stress-ng --vm "$threads" --vm-bytes 80% --vm-method all \
-            --timeout 30s 2>&1 | tee -a "$outfile"
-    else
-        {
-            echo "=== Memory Stress Test (python3) ==="
-            echo "Algorithm: $algo"
-            echo "Threads: $threads"
-            [ -n "$numa_opt" ] && echo "NUMA binding: $numa_opt"
-            echo ""
-        } >> "$outfile"
-
-        # 使用 python3 分配匿名内存触发 zswap
-        $numa_opt python3 -c "
-import mmap, time, os
-size = 512 * 1024 * 1024  # 512MB
-buf = mmap.mmap(-1, size)
-buf.write(b'x' * size)
-print(f'Allocated {size // 1024 // 1024}MB, PID={os.getpid()}')
-time.sleep(10)
-buf.close()
-" 2>&1 | tee -a "$outfile"
-    fi
-}
-
-# 主测试循环
+# ========== 主测试循环 ==========
 run_tests() {
     log_info "开始测试循环..."
     log_info "结果目录: $RESULT_DIR"
 
     for algo in $ALGOS; do
         log_info "========== 测试算法: $algo =========="
-        configure_zswap $algo
+        configure_zswap "$algo"
 
         for t in $THREADS; do
             log_info "---------- 线程数: $t ----------"
 
-            # 收集 zswap 状态
-            collect_zswap_stats $algo $t
+            # 运行内存压力测试
+            run_memtest "$algo" "$t"
 
-            # 运行基准测试
+            # 可选: 运行 llama-bench
             if [ $LLAMA_BENCH_AVAILABLE -eq 1 ]; then
-                run_llama_bench $algo $t
-            else
-                run_memtest $algo $t
+                run_llama_bench "$algo" "$t"
             fi
 
-            # 清空 zswap pool 为下一组测试
+            # 清空 zswap pool 为下一组测试准备
             if [ -w /sys/kernel/debug/zswap/flush_pool ]; then
                 echo 1 > /sys/kernel/debug/zswap/flush_pool
             fi
@@ -398,7 +557,7 @@ run_tests() {
     done
 }
 
-# 生成汇总报告
+# ========== 生成汇总报告 ==========
 generate_summary() {
     local summary_file="$RESULT_DIR/summary.txt"
 
@@ -412,7 +571,11 @@ generate_summary() {
         echo "Architecture: $(uname -m)"
         echo "CPU:          $(grep 'Model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
         echo "Memory:       $(grep MemTotal /proc/meminfo | awk '{print $2" kB"}')"
-        echo "Memory Limit: $MEM_LIMIT"
+        echo "Cgroup High:  $CGROUP_MEM_HIGH"
+        echo "Cgroup Max:   $CGROUP_MEM_MAX"
+        echo "Swapfile:     $SWAPFILE ($SWAPFILE_SIZE, priority=$SWAP_PRIORITY)"
+        echo "Per-Thread:   $PER_THREAD_MEM"
+        echo "Test Duration: ${TEST_DURATION}s"
         echo "Threads:      $THREADS"
         echo "Algorithms:   $ALGOS"
         echo ""
@@ -421,7 +584,6 @@ generate_summary() {
             echo "  HiSilicon ZIP: loaded (uacc_mode=1, pf_q_num=256)"
             grep -E "hisi-(lz4|deflate|zstd)-acomp" /proc/crypto 2>/dev/null | \
                 awk -F: '/driver/{print "  "$2}' || echo "  (no hw algos registered)"
-            # ZIP 设备 NUMA 拓扑
             for uacce in /sys/class/uacce/hisi_zip-*; do
                 if [ -d "$uacce" ] && [ -f "$uacce/node_id" ]; then
                     echo "  $(basename $uacce): NUMA node $(cat $uacce/node_id 2>/dev/null)"
@@ -431,8 +593,14 @@ generate_summary() {
             echo "  None (software only)"
         fi
         echo ""
-        echo "Test Results:"
-        echo "-------------"
+        echo "Memory Pressure Phases:"
+        echo "  无 swap:     total_load < ${CGROUP_MEM_HIGH}"
+        echo "  zswap 压缩:  ${CGROUP_MEM_HIGH} <= total_load < ${CGROUP_MEM_HIGH}+${SWAPFILE_SIZE}"
+        echo "  swap 满载:   total_load >= ${CGROUP_MEM_HIGH}+${SWAPFILE_SIZE}"
+        echo ""
+        echo "============================================"
+        echo "Per-Algorithm Results"
+        echo "============================================"
     } > "$summary_file"
 
     for algo in $ALGOS; do
@@ -441,27 +609,51 @@ generate_summary() {
         echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~" >> "$summary_file"
 
         for t in $THREADS; do
-            local bench_file="$RESULT_DIR/bench_${algo}_t${t}.log"
-            local zswap_file="$RESULT_DIR/zswap_${algo}_t${t}.log"
+            local phasefile="$RESULT_DIR/phase_${algo}_t${t}.log"
+            local zswap_pre="$RESULT_DIR/zswap_${algo}_t${t}_pre.log"
+            local zswap_post="$RESULT_DIR/zswap_${algo}_t${t}_post.log"
+            local total_mem_mb=$(( $(mem_to_bytes "$PER_THREAD_MEM") / 1024 / 1024 * t ))
 
             echo "" >> "$summary_file"
-            echo "  Threads: $t" >> "$summary_file"
+            echo "  Threads: $t  (total load: ${total_mem_mb}MB)" >> "$summary_file"
 
-            # 提取关键指标
-            if [ -f "$bench_file" ]; then
-                local throughput=$(grep -oP 'tokens per second:\s*\K[\d.]+' "$bench_file" 2>/dev/null | tail -1)
-                local latency=$(grep -oP 'eval time:\s*\K[\d.]+' "$bench_file" 2>/dev/null | tail -1)
-                [ -n "$throughput" ] && echo "    Throughput: $throughput tokens/s" >> "$summary_file"
-                [ -n "$latency" ] && echo "    Latency: $latency ms" >> "$summary_file"
+            # 从 phase file 提取峰值指标
+            if [ -f "$phasefile" ]; then
+                # 跳过 CSV 头, 取最后一行作为稳态值
+                local last_line=$(tail -1 "$phasefile" 2>/dev/null)
+                if [ -n "$last_line" ]; then
+                    local peak_mem=$(echo "$last_line" | cut -d, -f2)
+                    local peak_swap=$(echo "$last_line" | cut -d, -f3)
+                    local peak_stored=$(echo "$last_line" | cut -d, -f4)
+                    local peak_compressed=$(echo "$last_line" | cut -d, -f5)
+
+                    local peak_mem_mb=0
+                    local peak_swap_mb=0
+                    if [ -n "$peak_mem" ] && [ "$peak_mem" -eq "$peak_mem" ] 2>/dev/null; then
+                        peak_mem_mb=$((peak_mem / 1024 / 1024))
+                    fi
+                    if [ -n "$peak_swap" ] && [ "$peak_swap" -eq "$peak_swap" ] 2>/dev/null; then
+                        peak_swap_mb=$((peak_swap / 1024 / 1024))
+                    fi
+                    echo "    Peak memory.current: ${peak_mem_mb}MB" >> "$summary_file"
+                    echo "    Peak swap.current:   ${peak_swap_mb}MB" >> "$summary_file"
+
+                    # 压缩比
+                    if [ -n "$peak_compressed" ] && [ "$peak_compressed" -gt 0 ] 2>/dev/null; then
+                        local ratio=$(echo "scale=2; $peak_stored / $peak_compressed" | bc 2>/dev/null)
+                        echo "    Compression Ratio:   ${ratio}x" >> "$summary_file"
+                    fi
+                fi
             fi
 
-            # 提取压缩比
-            if [ -f "$zswap_file" ]; then
-                local stored=$(grep "stored_pages" "$zswap_file" 2>/dev/null | awk '{print $2}')
-                local compressed=$(grep "compressed_pages" "$zswap_file" 2>/dev/null | awk '{print $2}')
-                if [ -n "$stored" ] && [ -n "$compressed" ] && [ "$compressed" -gt 0 ]; then
-                    local ratio=$(echo "scale=2; $stored / $compressed" | bc 2>/dev/null)
-                    echo "    Compression Ratio: ${ratio}x" >> "$summary_file"
+            # 提取 zswap 前后差异
+            if [ -f "$zswap_pre" ] && [ -f "$zswap_post" ]; then
+                local pre_stored=$(grep "^stored_pages" "$zswap_pre" 2>/dev/null | awk '{print $2}' | head -1)
+                local post_stored=$(grep "^stored_pages" "$zswap_post" 2>/dev/null | awk '{print $2}' | head -1)
+                if [ -n "$pre_stored" ] && [ -n "$post_stored" ]; then
+                    local delta=$((post_stored - pre_stored))
+                    local delta_mb=$((delta * 4 / 1024))
+                    echo "    Zswap delta:         ${delta_mb}MB (${delta} pages)" >> "$summary_file"
                 fi
             fi
         done
@@ -478,7 +670,7 @@ generate_summary() {
     cat "$summary_file"
 }
 
-# 清理函数
+# ========== 清理函数 ==========
 cleanup() {
     log_info "清理测试环境..."
 
@@ -491,10 +683,17 @@ cleanup() {
         rmdir "$CGROUP_DIR" 2>/dev/null || true
     fi
 
+    # 清理 swapfile
+    if [ -f "$SWAPFILE" ]; then
+        swapoff "$SWAPFILE" 2>/dev/null || true
+        rm -f "$SWAPFILE" 2>/dev/null || true
+        log_info "swapfile 已清理"
+    fi
+
     log_info "清理完成"
 }
 
-# 主函数
+# ========== 主函数 ==========
 main() {
     log_info "Zswap Performance Benchmark Started"
     log_info "==================================="
@@ -507,6 +706,9 @@ main() {
 
     # 检测硬件加速器
     detect_hw_accelerator
+
+    # 准备 swap
+    prepare_swap
 
     # 初始化 cgroup
     setup_cgroup
