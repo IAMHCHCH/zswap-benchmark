@@ -247,20 +247,46 @@ MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"  # llama-bench 模型路径
 
 ### 5.3 下载 llama-bench 模型
 
-llama-bench 默认启用。需下载 GGUF 格式模型到指定路径：
+llama-bench 默认启用。由于环境A通常无法连外网，需在本地电脑下载后传输。
+
+#### 在本地电脑 (Windows/Mac) 下载
+
+在浏览器中直接下载，或使用命令行：
 
 ```bash
-mkdir -p /tmp/llama.cpp/models/
-
-# 方法1: wget 直接下载 (推荐, 单文件约 4.4GB)
-wget -O /tmp/llama.cpp/models/7b-q4_0.gguf \
+# wget (Git Bash / macOS / Linux)
+wget -O qwen2.5-7b-q4_0.gguf \
     https://huggingface.co/second-state/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_0.gguf
 
-# 方法2: huggingface-cli (官方分片版本, 需 pip install huggingface_hub)
-huggingface-cli download Qwen/Qwen2.5-7B-Instruct-GGUF \
-    --include "qwen2.5-7b-instruct-q4_0*.gguf" \
-    --local-dir /tmp/llama.cpp/models/ \
-    --local-dir-use-symlinks False
+# Windows PowerShell
+Invoke-WebRequest -Uri "https://huggingface.co/second-state/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_0.gguf" -OutFile "qwen2.5-7b-q4_0.gguf"
+```
+
+文件约 **4.4GB**。
+
+#### 传输到环境A
+
+```bash
+# 方法1: scp 传输 (需要能 SSH 到环境A)
+scp qwen2.5-7b-q4_0.gguf root@<环境A_IP>:/tmp/llama.cpp/models/7b-q4_0.gguf
+
+# 方法2: Windows 下使用 WinSCP 图形化传输
+#   1. 打开 WinSCP，主机填环境A IP，用户名 root
+#   2. 在服务器上创建目录: /tmp/llama.cpp/models/
+#   3. 将下载的文件上传并重命名为 7b-q4_0.gguf
+
+# 方法3: 从环境B中转 (如果环境B可以同时连通外网和环境A)
+# 在环境B上:
+wget -O /tmp/7b-q4_0.gguf \
+    https://huggingface.co/second-state/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_0.gguf
+scp /tmp/7b-q4_0.gguf root@<环境A_IP>:/tmp/llama.cpp/models/7b-q4_0.gguf
+
+# 方法4: U盘 (完全隔离网络)
+#   1. 将模型文件拷贝到U盘
+#   2. 在环境A上挂载: mount /dev/sdb1 /mnt/usb
+#   3. 复制:
+mkdir -p /tmp/llama.cpp/models/
+cp /mnt/usb/qwen2.5-7b-q4_0.gguf /tmp/llama.cpp/models/7b-q4_0.gguf
 ```
 
 验证模型文件：

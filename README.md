@@ -113,21 +113,32 @@ MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"  # llama-bench 模型路径
 
 ### 3. 下载 llama-bench 模型（可选）
 
-llama-bench 默认启用，需下载 GGUF 格式模型：
+llama-bench 默认启用，需下载 GGUF 格式模型。若测试服务器无法连外网，可在本地电脑下载后传输。
+
+#### 在本地电脑下载模型
 
 ```bash
-mkdir -p /tmp/llama.cpp/models/
-
-# 方法1: wget 直接下载 (推荐, 单文件)
-wget -O /tmp/llama.cpp/models/7b-q4_0.gguf \
+# wget (Linux/macOS/Git Bash)
+wget -O qwen2.5-7b-q4_0.gguf \
     https://huggingface.co/second-state/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_0.gguf
+```
 
-# 方法2: huggingface-cli (官方分片版本)
-pip install huggingface_hub
-huggingface-cli download Qwen/Qwen2.5-7B-Instruct-GGUF \
-    --include "qwen2.5-7b-instruct-q4_0*.gguf" \
-    --local-dir /tmp/llama.cpp/models/ \
-    --local-dir-use-symlinks False
+> Windows 用户也可直接在浏览器中打开上述 URL 下载，文件约 4.4GB。
+
+#### 传输到测试服务器
+
+```bash
+# 方法1: scp 传输 (推荐)
+scp qwen2.5-7b-q4_0.gguf root@<服务器IP>:/tmp/llama.cpp/models/7b-q4_0.gguf
+
+# 方法2: Windows 下使用 WinSCP / FileZilla 图形化传输
+#   主机: <服务器IP>, 用户: root, 协议: SFTP
+#   上传到: /tmp/llama.cpp/models/7b-q4_0.gguf
+
+# 方法3: U盘 / 移动硬盘拷贝 (适合隔离网络)
+#   1. 将模型文件拷贝到U盘
+#   2. 在服务器上挂载U盘: mount /dev/sdb1 /mnt/usb
+#   3. 复制: mkdir -p /tmp/llama.cpp/models && cp /mnt/usb/qwen2.5-7b-q4_0.gguf /tmp/llama.cpp/models/7b-q4_0.gguf
 ```
 
 > 若不下载模型，llama-bench 自动跳过，仅运行内存压力测试。
