@@ -62,32 +62,18 @@ for algo in lz4 lzo zstd; do
     fi
 done
 
-echo "[3/6] 安装系统依赖 (yum/dnf)..."
+echo "[3/6] 安装系统依赖..."
 yum install -y -q \
     gcc \
     gcc-c++ \
     make \
+    cmake \
     git \
-    perf \
     bc \
-    gawk \
-    libcgroup \
     stress-ng \
     python3 \
     python3-matplotlib \
-    || dnf install -y -q \
-    gcc \
-    gcc-c++ \
-    make \
-    git \
-    perf \
-    bc \
-    gawk \
-    libcgroup \
-    stress-ng \
-    python3 \
-    python3-matplotlib \
-    || echo "Some packages may have failed (ok if running in container)"
+    || echo "  部分包安装失败（可忽略）"
 
 # ========== 步骤 4: 配置 cgroup v2 ==========
 echo ""
@@ -158,11 +144,6 @@ if $CGROUP_V2_READY; then
 
     mkdir -p "$CGROUP_DIR"
     echo "    ✓ cgroup 目录已创建: $CGROUP_DIR"
-
-    # 在子 cgroup 中启用 memory 控制器（供更深层级使用）
-    if [ -f "$CGROUP_DIR/cgroup.subtree_control" ]; then
-        echo "+memory" > "$CGROUP_DIR/cgroup.subtree_control" 2>/dev/null || true
-    fi
 
     # 设置内存限制 (与 zswap_benchmark.sh 保持一致)
     MEM_LIMIT_SETUP="4G"
@@ -272,12 +253,6 @@ else
 
     echo "  编译 llama-bench (CMake)..."
     cd "$LLAMA_CPP_SRC"
-
-    # 确保 cmake 可用
-    if ! command -v cmake &> /dev/null; then
-        echo "  安装 cmake..."
-        yum install -y -q cmake || dnf install -y -q cmake
-    fi
 
     BUILD_LOG="$LLAMA_CPP_SRC/build.log"
     mkdir -p build && cd build

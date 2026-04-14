@@ -71,11 +71,6 @@ setup_cgroup() {
     # 创建 cgroup 目录
     sudo mkdir -p /sys/fs/cgroup/zswap_bench
 
-    # 在子 cgroup 中启用 memory 控制器
-    if [ -f /sys/fs/cgroup/zswap_bench/cgroup.subtree_control ]; then
-        echo "+memory" | sudo tee /sys/fs/cgroup/zswap_bench/cgroup.subtree_control > /dev/null 2>&1 || true
-    fi
-
     # 将当前进程加入 cgroup
     echo $$ | sudo tee /sys/fs/cgroup/zswap_bench/cgroup.procs > /dev/null
 
