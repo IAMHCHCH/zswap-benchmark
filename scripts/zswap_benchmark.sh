@@ -251,6 +251,7 @@ configure_zswap() {
     echo 1 > /sys/module/zswap/parameters/enabled
     echo "$algo" > /sys/module/zswap/parameters/compressor
     echo 25 > /sys/module/zswap/parameters/max_pool_percent
+    echo 0 > /sys/module/zswap/parameters/shrinker_enabled 2>/dev/null || true
 
     # 清空 pool
     if [ -w /sys/kernel/debug/zswap/flush_pool ]; then
@@ -260,6 +261,7 @@ configure_zswap() {
     # 验证配置
     local current_algo=$(cat /sys/module/zswap/parameters/compressor)
     local current_enabled=$(cat /sys/module/zswap/parameters/enabled)
+    local current_shrinker=$(cat /sys/module/zswap/parameters/shrinker_enabled 2>/dev/null || echo "N/A")
 
     local hw_status="软件"
     case $display_algo in
@@ -271,7 +273,7 @@ configure_zswap() {
         lzo)        hw_status="软件(lzo)" ;;
         zstd)       hw_status="软件(zstd)" ;;
     esac
-    log_info "zswap 配置: enabled=$current_enabled, compressor=$current_algo, 实现=$hw_status"
+    log_info "zswap 配置: enabled=$current_enabled, compressor=$current_algo, shrinker=$current_shrinker, 实现=$hw_status"
 
     sleep 1
 }
