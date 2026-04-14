@@ -34,7 +34,7 @@ log_err() { echo -e "${RED}[ERROR]${NC} $1"; }
 check_dependencies() {
     log_info "检查依赖..."
     
-    local deps=("perf" "cgexec" "bc" "awk")
+    local deps=("bc" "awk")
     for dep in "${deps[@]}"; do
         if ! command -v $dep &> /dev/null; then
             log_warn "缺少依赖: $dep"
