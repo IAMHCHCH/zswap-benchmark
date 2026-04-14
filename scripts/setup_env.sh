@@ -62,32 +62,18 @@ for algo in lz4 lzo zstd; do
     fi
 done
 
-echo "[3/6] 安装系统依赖 (yum/dnf)..."
+echo "[3/6] 安装系统依赖..."
 yum install -y -q \
     gcc \
     gcc-c++ \
     make \
+    cmake \
     git \
-    perf \
     bc \
-    gawk \
-    libcgroup \
     stress-ng \
     python3 \
     python3-matplotlib \
-    || dnf install -y -q \
-    gcc \
-    gcc-c++ \
-    make \
-    git \
-    perf \
-    bc \
-    gawk \
-    libcgroup \
-    stress-ng \
-    python3 \
-    python3-matplotlib \
-    || echo "Some packages may have failed (ok if running in container)"
+    || echo "  部分包安装失败（可忽略）"
 
 # ========== 步骤 4: 配置 cgroup v2 ==========
 echo ""
@@ -267,12 +253,6 @@ else
 
     echo "  编译 llama-bench (CMake)..."
     cd "$LLAMA_CPP_SRC"
-
-    # 确保 cmake 可用
-    if ! command -v cmake &> /dev/null; then
-        echo "  安装 cmake..."
-        yum install -y -q cmake || dnf install -y -q cmake
-    fi
 
     BUILD_LOG="$LLAMA_CPP_SRC/build.log"
     mkdir -p build && cd build
