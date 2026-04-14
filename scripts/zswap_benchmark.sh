@@ -14,7 +14,7 @@ set -e
 # ========== 配置参数 ==========
 MEM_LIMIT="4G"                      # 内存限制
 THREADS="1 2 4 8 16 32 64 128"     # 线程数 (适配鲲鹏920 128核)
-ALGOS="lz4 lzo"                      # 压缩算法 (zstd 硬件加速暂不可用, 待 hisi-zstd-acomp 就绪后加回)
+ALGOS="deflate lzo"                    # 压缩算法 (deflate 使用 hisi-deflate-acomp 硬件加速; lz4/zstd 硬件加速暂不可用)
 MODEL=""                            # 测试模型路径 (留空则跳过 llama-bench)
 PROMPT_LEN=512                       # prompt 长度
 GEN_LEN=128                          # 生成长度
@@ -97,8 +97,9 @@ detect_hw_accelerator() {
         for algo in $ALGOS; do
             local drv_name=""
             case $algo in
-                lz4)  drv_name="hisi-lz4-acomp" ;;
-                zstd) drv_name="hisi-zstd-acomp" ;;
+                deflate) drv_name="hisi-deflate-acomp" ;;
+                lz4)     drv_name="hisi-lz4-acomp" ;;
+                zstd)    drv_name="hisi-zstd-acomp" ;;
             esac
             if [ -n "$drv_name" ] && grep -q "$drv_name" /proc/crypto 2>/dev/null; then
                 log_hw "  $algo: 硬件加速可用 ($drv_name, priority 300)"
@@ -173,7 +174,6 @@ configure_zswap() {
     fi
 
     # 加载压缩算法的内核模块
-    # 软件实现
     case $algo in
         lz4)
             modprobe lz4 2>/dev/null || true
@@ -184,9 +184,12 @@ configure_zswap() {
         zstd)
             modprobe zstd 2>/dev/null || true
             ;;
+        deflate)
+            modprobe deflate 2>/dev/null || true
+            ;;
     esac
 
-    # 硬件加速 (HiSilicon ZIP, 支持 lz4/zstd, 不支持 lzo)
+    # 硬件加速 (HiSilicon ZIP, 支持 deflate/lz4/zstd, 不支持 lzo)
     if [ "$algo" != "lzo" ]; then
         rmmod hisi_zip 2>/dev/null || true
         modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
@@ -209,6 +212,9 @@ configure_zswap() {
     # 检查当前算法是否使用了硬件加速
     local hw_status="软件"
     case $algo in
+        deflate)
+            grep -q "hisi-deflate-acomp" /proc/crypto 2>/dev/null && hw_status="硬件(hisi_zip)"
+            ;;
         lz4)
             grep -q "hisi-lz4-acomp" /proc/crypto 2>/dev/null && hw_status="硬件(hisi_zip)"
             ;;
