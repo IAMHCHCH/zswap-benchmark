@@ -70,7 +70,7 @@ yum install -y -q \
     cmake \
     git \
     bc \
-    stress-ng \
+    numactl \
     python3 \
     python3-matplotlib \
     || echo "  部分包安装失败（可忽略）"

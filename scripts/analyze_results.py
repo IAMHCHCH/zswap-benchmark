@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 analyze_results.py - Zswap 性能结果分析脚本
-分析 stress-ng / llama-bench / zswap debug 统计，生成对比报告和图表
+解析 phase_*.log (逐秒采样)、zswap pre/post 快照，生成对比报告和图表
 """
 
+import csv
 import os
 import re
 import sys
@@ -16,6 +17,7 @@ try:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
@@ -38,29 +40,107 @@ ALGO_COLORS = {
     'deflate':    '#9467bd',
 }
 
+# 内存阶段阈值 (需与 benchmark 脚本一致)
+CGROUP_MEM_HIGH = 16 * 1024  # 16G in MB
+SWAP_SIZE = 16 * 1024         # 16G in MB
 
-class ZswapResult:
-    """单次测试结果"""
+
+class PhaseSample:
+    """单个采样点"""
+    __slots__ = ['timestamp', 'memory_current', 'swap_current',
+                 'zswap_stored_pages', 'zswap_compressed_pages']
+
+    def __init__(self, row: dict):
+        self.timestamp = float(row['timestamp'])
+        self.memory_current = int(row['memory_current'])
+        self.swap_current = int(row['swap_current'])
+        self.zswap_stored_pages = int(row.get('zswap_stored_pages', '0'))
+        self.zswap_compressed_pages = int(row.get('zswap_compressed_pages', '0'))
+
+    @property
+    def memory_mb(self) -> int:
+        return self.memory_current // (1024 * 1024)
+
+    @property
+    def swap_mb(self) -> int:
+        return self.swap_current // (1024 * 1024)
+
+    @property
+    def compression_ratio(self) -> Optional[float]:
+        if self.zswap_compressed_pages > 0:
+            return self.zswap_stored_pages / self.zswap_compressed_pages
+        return None
+
+
+class TestResult:
+    """单个 algo+threads 测试结果"""
     def __init__(self, algo: str, threads: int):
         self.algo = algo
         self.threads = threads
-        # llama-bench 指标
-        self.throughput = None      # tokens/s
-        self.latency = None         # ms
-        # stress-ng 指标
-        self.stress_bogo = None     # bogo ops/s
-        self.stress_time = None     # 实际运行时间
-        # zswap 指标
-        self.stored_pages = None
-        self.compressed_pages = None
-        self.compression_ratio = None
-        self.pool_total_size = None
-        self.pool_limit_hit = None
-        self.reject_compress_poor = None
-        self.reject_alloc_fail = None
-        self.reject_kmemcache_fail = None
-        # memory info
-        self.mem_used = None        # 测试期间内存使用量
+        self.samples: List[PhaseSample] = []
+        # 元数据 (从 memtest_*.log 头部解析)
+        self.total_mem_mb: Optional[int] = None
+        self.expected_phase: Optional[str] = None
+        self.numa_policy: Optional[str] = None
+        self.duration: Optional[int] = None
+        # zswap pre/post 快照
+        self.zswap_pre: Dict[str, int] = {}
+        self.zswap_post: Dict[str, int] = {}
+        # llama-bench (可选)
+        self.throughput: Optional[float] = None
+        self.latency: Optional[float] = None
+
+    @property
+    def peak_memory_mb(self) -> Optional[int]:
+        if not self.samples:
+            return None
+        return max(s.memory_mb for s in self.samples)
+
+    @property
+    def peak_swap_mb(self) -> Optional[int]:
+        if not self.samples:
+            return None
+        return max(s.swap_mb for s in self.samples)
+
+    @property
+    def peak_stored_pages(self) -> Optional[int]:
+        if not self.samples:
+            return None
+        return max(s.zswap_stored_pages for s in self.samples)
+
+    @property
+    def peak_compressed_pages(self) -> Optional[int]:
+        if not self.samples:
+            return None
+        return max(s.zswap_compressed_pages for s in self.samples)
+
+    @property
+    def compression_ratio(self) -> Optional[float]:
+        """稳态压缩比 (取最后 1/3 样本的中位数)"""
+        if not self.samples:
+            return None
+        tail = self.samples[len(self.samples) // 3:]
+        ratios = [s.compression_ratio for s in tail if s.compression_ratio is not None]
+        if not ratios:
+            return None
+        ratios.sort()
+        return ratios[len(ratios) // 2]
+
+    @property
+    def zswap_delta_pages(self) -> Optional[int]:
+        """测试前后 zswap stored_pages 增量"""
+        pre = self.zswap_pre.get('stored_pages')
+        post = self.zswap_post.get('stored_pages')
+        if pre is not None and post is not None:
+            return post - pre
+        return None
+
+    @property
+    def zswap_delta_mb(self) -> Optional[int]:
+        delta = self.zswap_delta_pages
+        if delta is not None:
+            return delta * 4 // 1024  # 4KB per page
+        return None
 
 
 class ZswapAnalyzer:
@@ -68,16 +148,14 @@ class ZswapAnalyzer:
 
     def __init__(self, results_dir: str):
         self.results_dir = Path(results_dir)
-        self.results: Dict[str, List[ZswapResult]] = {}
+        self.results: Dict[str, List[TestResult]] = {}
 
-    # ---- 解析 stress-ng 输出 ----
-    def parse_memtest_log(self, filepath: Path) -> Optional[ZswapResult]:
+    # ---- 解析 phase_*.log (逐秒采样 CSV) ----
+    def parse_phase_log(self, filepath: Path) -> Optional[TestResult]:
         if not filepath.exists():
             return None
 
-        content = filepath.read_text()
-
-        # 从文件名提取参数: memtest_algo_tN.log
+        # 从文件名提取: phase_algo_tN.log
         filename = filepath.stem
         parts = filename.split('_')
         if len(parts) < 3:
@@ -85,48 +163,23 @@ class ZswapAnalyzer:
         algo = parts[1]
         threads = int(parts[2].replace('t', ''))
 
-        result = ZswapResult(algo, threads)
+        result = TestResult(algo, threads)
 
-        # stress-ng 输出格式:
-        # stress-ng ... run completed in X.XX seconds
-        # stress-ng ... XX.XX bogo ops/s
-        match = re.search(r'(\d+\.\d+)\s+bogo ops/s', content)
-        if match:
-            result.stress_bogo = float(match.group(1))
+        with open(filepath) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    result.samples.append(PhaseSample(row))
+                except (ValueError, KeyError):
+                    continue
 
-        match = re.search(r'run completed in\s+(\d+\.\d+)\s+seconds', content)
-        if match:
-            result.stress_time = float(match.group(1))
+        if not result.samples:
+            return None
 
         return result
 
-    # ---- 解析 llama-bench 输出 ----
-    def parse_bench_log(self, filepath: Path) -> Optional[ZswapResult]:
-        if not filepath.exists():
-            return None
-
-        content = filepath.read_text()
-        filename = filepath.stem
-        parts = filename.split('_')
-        if len(parts) < 3:
-            return None
-        algo = parts[1]
-        threads = int(parts[2].replace('t', ''))
-
-        result = ZswapResult(algo, threads)
-
-        match = re.search(r'tokens per second:\s*([\d.]+)', content)
-        if match:
-            result.throughput = float(match.group(1))
-
-        match = re.search(r'eval time:\s*([\d.]+)', content)
-        if match:
-            result.latency = float(match.group(1))
-
-        return result
-
-    # ---- 解析 zswap debug 统计 ----
-    def parse_zswap_log(self, filepath: Path):
+    # ---- 解析 memtest_*.log 头部 (元数据) ----
+    def parse_memtest_header(self, filepath: Path):
         if not filepath.exists():
             return
 
@@ -138,274 +191,224 @@ class ZswapAnalyzer:
         algo = parts[1]
         threads = int(parts[2].replace('t', ''))
 
-        # 查找或创建对应 result
         result = self._find_or_create(algo, threads)
 
-        # stored_pages / compressed_pages -> 压缩比
-        stored = self._extract_int(r'stored_pages\s+(\d+)', content)
-        compressed = self._extract_int(r'compressed_pages\s+(\d+)', content)
-        if stored is not None:
-            result.stored_pages = stored
-        if compressed is not None:
-            result.compressed_pages = compressed
-        if stored and compressed and compressed > 0:
-            result.compression_ratio = stored / compressed
+        # 提取元数据
+        m = re.search(r'Total_Mem:\s+(\d+)MB', content)
+        if m:
+            result.total_mem_mb = int(m.group(1))
+        m = re.search(r'Expected_Phase:\s+(.+)', content)
+        if m:
+            result.expected_phase = m.group(1).strip()
+        m = re.search(r'NUMA_Policy:\s+(.*)', content)
+        if m:
+            policy = m.group(1).strip()
+            result.numa_policy = policy if policy else None
+        m = re.search(r'Duration:\s+(\d+)s', content)
+        if m:
+            result.duration = int(m.group(1))
 
-        # pool_total_size
-        pool_size = self._extract_int(r'pool_total_size\s+(\d+)', content)
-        if pool_size is not None:
-            result.pool_total_size = pool_size
+    # ---- 解析 llama-bench 输出 ----
+    def parse_bench_log(self, filepath: Path):
+        if not filepath.exists():
+            return
 
-        # pool_limit_hit
-        result.pool_limit_hit = self._extract_int(r'pool_limit_hit\s+(\d+)', content)
+        content = filepath.read_text()
+        filename = filepath.stem
+        parts = filename.split('_')
+        if len(parts) < 3:
+            return
+        algo = parts[1]
+        threads = int(parts[2].replace('t', ''))
 
-        # reject counters
-        result.reject_compress_poor = self._extract_int(
-            r'reject_compress_poor\s+(\d+)', content)
-        result.reject_alloc_fail = self._extract_int(
-            r'reject_alloc_fail\s+(\d+)', content)
-        result.reject_kmemcache_fail = self._extract_int(
-            r'reject_kmemcache_fail\s+(\d+)', content)
+        result = self._find_or_create(algo, threads)
 
-        # memory used
-        mem_avail_before = self._extract_int(r'MemAvailable:\s+(\d+)', content)
-        if mem_avail_before:
-            # 从 MemTotal 估算使用量
-            mem_total = self._extract_int(r'MemTotal:\s+(\d+)', content)
-            if mem_total:
-                result.mem_used = mem_total - mem_avail_before
+        m = re.search(r'tokens per second:\s*([\d.]+)', content)
+        if m:
+            result.throughput = float(m.group(1))
+        m = re.search(r'eval time:\s*([\d.]+)', content)
+        if m:
+            result.latency = float(m.group(1))
 
-    def _extract_int(self, pattern: str, text: str) -> Optional[int]:
-        match = re.search(pattern, text)
-        return int(match.group(1)) if match else None
+    # ---- 解析 zswap pre/post 快照 ----
+    def parse_zswap_snapshot(self, filepath: Path):
+        if not filepath.exists():
+            return
 
-    def _find_or_create(self, algo: str, threads: int) -> ZswapResult:
+        content = filepath.read_text()
+        filename = filepath.stem
+        # 文件名: zswap_algo_tN_pre.log 或 zswap_algo_tN_post.log
+        parts = filename.split('_')
+        if len(parts) < 4:
+            return
+        algo = parts[1]
+        threads = int(parts[2].replace('t', ''))
+        tag = parts[3]  # "pre" or "post"
+
+        result = self._find_or_create(algo, threads)
+
+        stats = {}
+        for key in ['stored_pages', 'compressed_pages', 'pool_total_size',
+                     'pool_limit_hit', 'reject_compress_poor', 'reject_alloc_fail']:
+            m = re.search(rf'^{key}\s+(\d+)', content, re.MULTILINE)
+            if m:
+                stats[key] = int(m.group(1))
+
+        if tag == 'pre':
+            result.zswap_pre = stats
+        else:
+            result.zswap_post = stats
+
+    def _find_or_create(self, algo: str, threads: int) -> TestResult:
         if algo not in self.results:
             self.results[algo] = []
         for r in self.results[algo]:
             if r.threads == threads:
                 return r
-        r = ZswapResult(algo, threads)
+        r = TestResult(algo, threads)
         self.results[algo].append(r)
         return r
 
     # ---- 加载所有结果 ----
     def load_results(self):
-        # memtest
+        # phase_*.log (逐秒采样)
+        for f in sorted(self.results_dir.glob("phase_*.log")):
+            result = self.parse_phase_log(f)
+            if result:
+                self._merge_result(result)
+
+        # memtest_*.log (元数据)
         for f in sorted(self.results_dir.glob("memtest_*.log")):
-            result = self.parse_memtest_log(f)
-            if result:
-                self._merge_result(result)
+            self.parse_memtest_header(f)
 
-        # bench (llama-bench)
+        # bench_*.log (llama-bench, 可选)
         for f in sorted(self.results_dir.glob("bench_*.log")):
-            result = self.parse_bench_log(f)
-            if result:
-                self._merge_result(result)
+            self.parse_bench_log(f)
 
-        # zswap debug stats (补充到已有 result 上)
-        for f in sorted(self.results_dir.glob("zswap_*.log")):
-            self.parse_zswap_log(f)
+        # zswap pre/post 快照
+        for f in sorted(self.results_dir.glob("zswap_*_pre.log")):
+            self.parse_zswap_snapshot(f)
+        for f in sorted(self.results_dir.glob("zswap_*_post.log")):
+            self.parse_zswap_snapshot(f)
 
-    def _merge_result(self, result: ZswapResult):
+    def _merge_result(self, result: TestResult):
         algo = result.algo
         if algo not in self.results:
             self.results[algo] = []
-        # 查找已有同 algo+threads 的 result
         for r in self.results[algo]:
             if r.threads == result.threads:
-                # 补充数据
-                if result.throughput is not None:
-                    r.throughput = result.throughput
-                if result.latency is not None:
-                    r.latency = result.latency
-                if result.stress_bogo is not None:
-                    r.stress_bogo = result.stress_bogo
-                if result.stress_time is not None:
-                    r.stress_time = result.stress_time
+                # 合并采样数据
+                r.samples.extend(result.samples)
                 return
         self.results[algo].append(result)
 
-    # ---- 计算线性效率 ----
-    def calculate_linearity(self, algo: str, metric: str = 'auto') -> Dict:
-        if algo not in self.results:
-            return {}
-
-        results = sorted(self.results[algo], key=lambda x: x.threads)
-
-        # 选择度量指标
-        def get_metric(r):
-            if metric == 'throughput' or (metric == 'auto' and r.throughput):
-                return r.throughput
-            if metric == 'bogo' or (metric == 'auto' and r.stress_bogo):
-                return r.stress_bogo
-            return None
-
-        values = [(r.threads, get_metric(r)) for r in results]
-        baseline_val = None
-        for _, v in values:
-            if v is not None:
-                baseline_val = v
-                break
-
-        if baseline_val is None or baseline_val == 0:
-            return {}
-
-        linearity = {}
-        for r in results:
-            v = get_metric(r)
-            if v is not None and r.threads > 0:
-                actual_ratio = v / baseline_val
-                efficiency = (actual_ratio / r.threads) * 100
-                linearity[r.threads] = {
-                    'value': v,
-                    'expected': baseline_val * r.threads,
-                    'actual_ratio': round(actual_ratio, 2),
-                    'efficiency': round(efficiency, 1),
-                }
-        return linearity
+    # ---- 计算内存压力阶段 ----
+    @staticmethod
+    def classify_phase(total_mem_mb: int) -> str:
+        if total_mem_mb < CGROUP_MEM_HIGH:
+            return "无 swap"
+        elif total_mem_mb < CGROUP_MEM_HIGH + SWAP_SIZE:
+            return "zswap 压缩"
+        else:
+            return "swap 满载"
 
     # ---- 文本报告 ----
     def generate_report(self) -> str:
         lines = []
-        lines.append("=" * 70)
+        lines.append("=" * 80)
         lines.append("  Zswap Performance Analysis Report")
-        lines.append("=" * 70)
+        lines.append("=" * 80)
         lines.append(f"Generated:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append(f"Results Dir:  {self.results_dir}")
         lines.append(f"Algorithms:   {', '.join(sorted(self.results.keys()))}")
+        lines.append(f"Phase Thresholds: 无 swap < {CGROUP_MEM_HIGH}MB, "
+                     f"zswap < {CGROUP_MEM_HIGH + SWAP_SIZE}MB, swap 满载 >= {CGROUP_MEM_HIGH + SWAP_SIZE}MB")
         lines.append("")
 
-        # ---- 1. 压缩比对比 ----
-        lines.append("=" * 70)
-        lines.append("  1. 压缩比对比 (Compression Ratio)")
-        lines.append("=" * 70)
+        # ---- 1. 内存压力阶段总览 ----
+        lines.append("=" * 80)
+        lines.append("  1. 内存压力阶段总览")
+        lines.append("=" * 80)
         lines.append("")
-        lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Stored Pages':<15} "
-                     f"{'Compressed Pages':<18} {'Ratio':<10}")
-        lines.append("-" * 70)
+        lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Total Load':<14} "
+                     f"{'Phase':<16} {'Peak Mem':<12} {'Peak Swap':<12}")
+        lines.append("-" * 80)
 
         for algo in sorted(self.results.keys()):
             results = sorted(self.results[algo], key=lambda x: x.threads)
             label = ALGO_LABELS.get(algo, algo)
             for r in results:
-                stored = f"{r.stored_pages}" if r.stored_pages else "N/A"
-                compressed = f"{r.compressed_pages}" if r.compressed_pages else "N/A"
+                load = f"{r.total_mem_mb}MB" if r.total_mem_mb else "N/A"
+                phase = r.expected_phase or self.classify_phase(r.total_mem_mb or 0)
+                peak_mem = f"{r.peak_memory_mb}MB" if r.peak_memory_mb is not None else "N/A"
+                peak_swap = f"{r.peak_swap_mb}MB" if r.peak_swap_mb is not None else "N/A"
+                lines.append(f"{label:<18} {r.threads:<10} {load:<14} "
+                             f"{phase:<16} {peak_mem:<12} {peak_swap:<12}")
+            lines.append("")
+
+        # ---- 2. 压缩比对比 ----
+        lines.append("=" * 80)
+        lines.append("  2. 压缩比对比 (稳态)")
+        lines.append("=" * 80)
+        lines.append("")
+        lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Total Load':<14} "
+                     f"{'Phase':<16} {'Ratio':<10} {'Zswap Delta':<14}")
+        lines.append("-" * 80)
+
+        for algo in sorted(self.results.keys()):
+            results = sorted(self.results[algo], key=lambda x: x.threads)
+            label = ALGO_LABELS.get(algo, algo)
+            for r in results:
+                load = f"{r.total_mem_mb}MB" if r.total_mem_mb else "N/A"
+                phase = r.expected_phase or self.classify_phase(r.total_mem_mb or 0)
                 ratio = f"{r.compression_ratio:.2f}x" if r.compression_ratio else "N/A"
-                lines.append(f"{label:<18} {r.threads:<10} {stored:<15} "
-                             f"{compressed:<18} {ratio:<10}")
+                delta = f"{r.zswap_delta_mb}MB" if r.zswap_delta_mb is not None else "N/A"
+                lines.append(f"{label:<18} {r.threads:<10} {load:<14} "
+                             f"{phase:<16} {ratio:<10} {delta:<14}")
             lines.append("")
 
-        # ---- 2. Zswap Pool 统计 ----
-        lines.append("=" * 70)
-        lines.append("  2. Zswap Pool 统计")
-        lines.append("=" * 70)
+        # ---- 3. Zswap Pool 统计 ----
+        lines.append("=" * 80)
+        lines.append("  3. Zswap Pool 统计 (post-test)")
+        lines.append("=" * 80)
         lines.append("")
-        lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Pool Size':<15} "
+        lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Pool Size':<14} "
                      f"{'Limit Hit':<12} {'Rej(Poor)':<12} {'Rej(Alloc)':<12}")
-        lines.append("-" * 70)
+        lines.append("-" * 80)
 
         for algo in sorted(self.results.keys()):
             results = sorted(self.results[algo], key=lambda x: x.threads)
             label = ALGO_LABELS.get(algo, algo)
             for r in results:
-                pool = f"{r.pool_total_size}" if r.pool_total_size else "N/A"
-                limit_hit = f"{r.pool_limit_hit}" if r.pool_limit_hit is not None else "N/A"
-                rej_poor = f"{r.reject_compress_poor}" if r.reject_compress_poor is not None else "N/A"
-                rej_alloc = f"{r.reject_alloc_fail}" if r.reject_alloc_fail is not None else "N/A"
-                lines.append(f"{label:<18} {r.threads:<10} {pool:<15} "
-                             f"{limit_hit:<12} {rej_poor:<12} {rej_alloc:<12}")
+                post = r.zswap_post
+                pool = f"{post.get('pool_total_size', 0)}" if post.get('pool_total_size') else "N/A"
+                limit = f"{post.get('pool_limit_hit', 0)}" if 'pool_limit_hit' in post else "N/A"
+                rej_poor = f"{post.get('reject_compress_poor', 0)}" if 'reject_compress_poor' in post else "N/A"
+                rej_alloc = f"{post.get('reject_alloc_fail', 0)}" if 'reject_alloc_fail' in post else "N/A"
+                lines.append(f"{label:<18} {r.threads:<10} {pool:<14} "
+                             f"{limit:<12} {rej_poor:<12} {rej_alloc:<12}")
             lines.append("")
 
-        # ---- 3. 性能指标 (stress-ng / llama-bench) ----
-        lines.append("=" * 70)
-        lines.append("  3. 性能指标")
-        lines.append("=" * 70)
-
-        # 检测哪种测试数据可用
-        has_bogo = any(r.stress_bogo for algo in self.results.values() for r in algo)
+        # ---- 4. llama-bench 结果 (可选) ----
         has_tps = any(r.throughput for algo in self.results.values() for r in algo)
-
-        if has_bogo:
-            lines.append("")
-            lines.append("  [stress-ng bogo ops/s]")
-            lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Bogo ops/s':<15} "
-                         f"{'Efficiency':<12} {'Time(s)':<10}")
-            lines.append("-" * 70)
-
-            for algo in sorted(self.results.keys()):
-                results = sorted(self.results[algo], key=lambda x: x.threads)
-                label = ALGO_LABELS.get(algo, algo)
-                linearity = self.calculate_linearity(algo, 'bogo')
-                for r in results:
-                    bogo = f"{r.stress_bogo:.2f}" if r.stress_bogo else "N/A"
-                    eff = ""
-                    if r.threads in linearity:
-                        eff = f"{linearity[r.threads]['efficiency']:.1f}%"
-                    t = f"{r.stress_time:.2f}" if r.stress_time else "N/A"
-                    lines.append(f"{label:<18} {r.threads:<10} {bogo:<15} "
-                                 f"{eff:<12} {t:<10}")
-                lines.append("")
-
         if has_tps:
+            lines.append("=" * 80)
+            lines.append("  4. llama-bench 结果")
+            lines.append("=" * 80)
             lines.append("")
-            lines.append("  [llama-bench tokens/s]")
-            lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Tokens/s':<15} "
-                         f"{'Latency(ms)':<12} {'Efficiency':<12}")
-            lines.append("-" * 70)
-
+            lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Tokens/s':<15} {'Latency(ms)':<12}")
+            lines.append("-" * 80)
             for algo in sorted(self.results.keys()):
                 results = sorted(self.results[algo], key=lambda x: x.threads)
                 label = ALGO_LABELS.get(algo, algo)
-                linearity = self.calculate_linearity(algo, 'throughput')
                 for r in results:
-                    tps = f"{r.throughput:.1f}" if r.throughput else "N/A"
-                    lat = f"{r.latency:.1f}" if r.latency else "N/A"
-                    eff = ""
-                    if r.threads in linearity:
-                        eff = f"{linearity[r.threads]['efficiency']:.1f}%"
-                    lines.append(f"{label:<18} {r.threads:<10} {tps:<15} "
-                                 f"{lat:<12} {eff:<12}")
-                lines.append("")
-
-        # ---- 4. 线性效率分析 ----
-        lines.append("=" * 70)
-        lines.append("  4. 线性效率分析")
-        lines.append("=" * 70)
-        lines.append("")
-
-        metric = 'bogo' if has_bogo else ('throughput' if has_tps else None)
-        if metric:
-            metric_name = "bogo ops/s" if metric == 'bogo' else "tokens/s"
-            lines.append(f"  度量指标: {metric_name}")
-            lines.append(f"  理想效率: 线程翻倍 -> 性能翻倍 (100%)")
+                    if r.throughput:
+                        tps = f"{r.throughput:.1f}"
+                        lat = f"{r.latency:.1f}" if r.latency else "N/A"
+                        lines.append(f"{label:<18} {r.threads:<10} {tps:<15} {lat:<12}")
             lines.append("")
 
-            for algo in sorted(self.results.keys()):
-                label = ALGO_LABELS.get(algo, algo)
-                linearity = self.calculate_linearity(algo, metric)
-                if not linearity:
-                    continue
-                lines.append(f"  {label}:")
-                for threads in sorted(linearity.keys()):
-                    d = linearity[threads]
-                    mark = "OK" if d['efficiency'] >= 80 else ("--" if d['efficiency'] >= 50 else "!!")
-                    lines.append(f"    {threads:>3} threads: {d['value']:>10.2f}  "
-                                 f"eff={d['efficiency']:>5.1f}%  {mark}")
-                # 饱和点
-                sorted_threads = sorted(linearity.keys())
-                for i in range(len(sorted_threads) - 1):
-                    t1, t2 = sorted_threads[i], sorted_threads[i + 1]
-                    e1 = linearity[t1]['efficiency']
-                    e2 = linearity[t2]['efficiency']
-                    if e2 < e1 - 10:
-                        lines.append(f"    >> 饱和点: ~{t2} threads (效率从 {e1:.1f}% 降至 {e2:.1f}%)")
-                        break
-                lines.append("")
-        else:
-            lines.append("  (无性能数据可用于线性分析)")
-
-        lines.append("=" * 70)
+        lines.append("=" * 80)
         return "\n".join(lines)
 
     # ---- 图表生成 ----
@@ -414,166 +417,236 @@ class ZswapAnalyzer:
             return
 
         output_dir = Path(output_dir)
-
-        # 检测可用指标
-        has_bogo = any(r.stress_bogo for algo in self.results.values() for r in algo)
-        has_tps = any(r.throughput for algo in self.results.values() for r in algo)
-        has_ratio = any(r.compression_ratio for algo in self.results.values() for r in algo)
-
         algos = sorted(self.results.keys())
 
-        # ---- 图1: 性能 vs 线程数 ----
-        metric = None
-        metric_label = ""
-        if has_bogo:
-            metric = 'stress_bogo'
-            metric_label = 'Bogo ops/s (stress-ng)'
-        elif has_tps:
-            metric = 'throughput'
-            metric_label = 'Tokens/s (llama-bench)'
+        # ---- 图1: 内存压力阶段图 (堆叠面积图) ----
+        fig, ax = plt.subplots(figsize=(14, 8))
+        for algo in algos:
+            results = sorted(self.results[algo], key=lambda x: x.threads)
+            threads_list = []
+            mem_peak = []
+            swap_peak = []
+            for r in results:
+                if r.peak_memory_mb is not None:
+                    threads_list.append(r.threads)
+                    mem_peak.append(r.peak_memory_mb)
+                    swap_peak.append(r.peak_swap_mb or 0)
 
-        if metric:
-            fig, ax = plt.subplots(figsize=(12, 7))
-            for algo in algos:
-                results = sorted(self.results[algo], key=lambda x: x.threads)
-                threads = []
-                values = []
-                for r in results:
-                    v = getattr(r, metric)
-                    if v is not None:
-                        threads.append(r.threads)
-                        values.append(v)
-                if threads:
-                    color = ALGO_COLORS.get(algo, 'gray')
-                    label = ALGO_LABELS.get(algo, algo)
-                    ax.plot(threads, values, 'o-', label=label, color=color, linewidth=2)
+            if threads_list:
+                color = ALGO_COLORS.get(algo, 'gray')
+                label = ALGO_LABELS.get(algo, algo)
+                ax.plot(threads_list, mem_peak, 'o-', label=f'{label} memory', color=color, linewidth=2)
+                if any(s > 0 for s in swap_peak):
+                    ax.plot(threads_list, swap_peak, 's--', label=f'{label} swap',
+                            color=color, linewidth=1.5, alpha=0.7)
 
-            # 理想线性参考线 (取第一个算法的基线)
-            first_algo = algos[0]
-            first_results = sorted(self.results[first_algo], key=lambda x: x.threads)
-            baseline_val = None
-            for r in first_results:
-                v = getattr(r, metric)
-                if v is not None:
-                    baseline_val = v
+        # 标注阶段区域
+        ax.axhline(y=CGROUP_MEM_HIGH, color='red', linestyle=':', alpha=0.5, label=f'cgroup high ({CGROUP_MEM_HIGH}MB)')
+        ax.set_xlabel('Threads')
+        ax.set_ylabel('Memory Usage (MB)')
+        ax.set_title('Zswap Benchmark: Memory Pressure by Threads')
+        ax.legend(loc='upper left', fontsize=8)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(output_dir / 'memory_pressure.png', dpi=150)
+        plt.close(fig)
+
+        # ---- 图2: 三阶段性能折线 (memory + swap 随时间) ----
+        # 选取高线程数 (接近或超过 cgroup high) 的测试绘制时间序列
+        for algo in algos:
+            results = sorted(self.results[algo], key=lambda x: x.threads)
+            # 选取有 swap 使用的最高线程数测试
+            best_r = None
+            for r in reversed(results):
+                if r.samples and r.peak_swap_mb and r.peak_swap_mb > 0:
+                    best_r = r
                     break
-            if baseline_val:
-                all_threads = sorted(set(
-                    t for algo in self.results for r in self.results[algo] for t in [r.threads]
-                ))
-                ideal = [baseline_val * t for t in all_threads]
-                ax.plot(all_threads, ideal, 'k--', alpha=0.3, label='Ideal (linear)', linewidth=1)
+            if best_r is None:
+                # fallback: 取最高线程数
+                best_r = results[-1] if results else None
+            if best_r is None or not best_r.samples:
+                continue
 
-            ax.set_xlabel('Threads')
-            ax.set_ylabel(metric_label)
-            ax.set_title('Zswap Benchmark: Performance vs Threads')
-            ax.legend(loc='upper left')
-            ax.grid(True, alpha=0.3)
+            fig, ax1 = plt.subplots(figsize=(14, 8))
+            times = [s.timestamp - best_r.samples[0].timestamp for s in best_r.samples]
+            mem_vals = [s.memory_mb for s in best_r.samples]
+            swap_vals = [s.swap_mb for s in best_r.samples]
+
+            ax1.fill_between(times, mem_vals, alpha=0.3, color='#1f77b4', label='memory.current')
+            ax1.plot(times, mem_vals, color='#1f77b4', linewidth=1.5)
+            ax1.fill_between(times, swap_vals, alpha=0.3, color='#ff7f0e', label='swap.current')
+            ax1.plot(times, swap_vals, color='#ff7f0e', linewidth=1.5)
+
+            ax1.axhline(y=CGROUP_MEM_HIGH, color='red', linestyle=':', alpha=0.5)
+            ax1.set_xlabel('Time (s)')
+            ax1.set_ylabel('Memory (MB)')
+            label = ALGO_LABELS.get(algo, algo)
+            ax1.set_title(f'{label} @ {best_r.threads} threads: Memory/Swap Over Time')
+            ax1.legend(loc='upper left')
+            ax1.grid(True, alpha=0.3)
             fig.tight_layout()
-            fig.savefig(output_dir / 'performance_vs_threads.png', dpi=150)
+            safe_algo = algo.replace('-', '_')
+            fig.savefig(output_dir / f'timeseries_{safe_algo}_t{best_r.threads}.png', dpi=150)
             plt.close(fig)
 
-        # ---- 图2: 压缩比柱状图 ----
-        if has_ratio:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            labels = []
-            ratios = []
-            colors = []
-            for algo in algos:
-                results = sorted(self.results[algo], key=lambda x: x.threads)
-                # 取中间线程数的压缩比
-                mid = len(results) // 2
-                if results and results[mid].compression_ratio:
-                    labels.append(ALGO_LABELS.get(algo, algo))
-                    ratios.append(results[mid].compression_ratio)
+        # ---- 图3: 各算法 swap 使用对比 ----
+        fig, ax = plt.subplots(figsize=(14, 8))
+        for algo in algos:
+            results = sorted(self.results[algo], key=lambda x: x.threads)
+            threads_list = [r.threads for r in results if r.peak_swap_mb is not None]
+            swap_vals = [r.peak_swap_mb for r in results if r.peak_swap_mb is not None]
+            if threads_list:
+                color = ALGO_COLORS.get(algo, 'gray')
+                label = ALGO_LABELS.get(algo, algo)
+                ax.plot(threads_list, swap_vals, 'o-', label=label, color=color, linewidth=2)
+
+        ax.axhline(y=SWAP_SIZE, color='red', linestyle=':', alpha=0.5, label=f'swap limit ({SWAP_SIZE}MB)')
+        ax.set_xlabel('Threads')
+        ax.set_ylabel('Peak Swap Usage (MB)')
+        ax.set_title('Zswap Benchmark: Swap Usage by Algorithm')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(output_dir / 'swap_usage.png', dpi=150)
+        plt.close(fig)
+
+        # ---- 图4: 压缩比对比 (柱状图) ----
+        fig, ax = plt.subplots(figsize=(12, 7))
+        labels = []
+        ratios = []
+        colors = []
+        for algo in algos:
+            results = sorted(self.results[algo], key=lambda x: x.threads)
+            # 取高线程数 (有 zswap 活动) 的结果
+            for r in reversed(results):
+                if r.compression_ratio is not None:
+                    labels.append(f"{ALGO_LABELS.get(algo, algo)}\n({r.threads}T)")
+                    ratios.append(r.compression_ratio)
                     colors.append(ALGO_COLORS.get(algo, 'gray'))
+                    break
 
-            if ratios:
-                bars = ax.bar(range(len(labels)), ratios, color=colors)
-                ax.set_xticks(range(len(labels)))
-                ax.set_xticklabels(labels, rotation=15)
-                ax.set_ylabel('Compression Ratio (stored/compressed)')
-                ax.set_title('Zswap Compression Ratio by Algorithm')
-                for bar, ratio in zip(bars, ratios):
-                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
-                            f'{ratio:.2f}x', ha='center', va='bottom', fontsize=10)
-                ax.grid(True, alpha=0.3, axis='y')
-                fig.tight_layout()
-                fig.savefig(output_dir / 'compression_ratio.png', dpi=150)
-                plt.close(fig)
-
-        # ---- 图3: 线性效率 ----
-        if metric:
-            linearity_metric = 'bogo' if has_bogo else 'throughput'
-            fig, ax = plt.subplots(figsize=(12, 7))
-            for algo in algos:
-                linearity = self.calculate_linearity(algo, linearity_metric)
-                if linearity:
-                    threads = sorted(linearity.keys())
-                    effs = [linearity[t]['efficiency'] for t in threads]
-                    color = ALGO_COLORS.get(algo, 'gray')
-                    label = ALGO_LABELS.get(algo, algo)
-                    ax.plot(threads, effs, 'o-', label=label, color=color, linewidth=2)
-
-            ax.axhline(y=100, color='black', linestyle='--', alpha=0.4, label='Ideal (100%)')
-            ax.axhline(y=80, color='green', linestyle=':', alpha=0.5, label='Good (80%)')
-            ax.axhline(y=50, color='orange', linestyle=':', alpha=0.5, label='Fair (50%)')
-            ax.set_xlabel('Threads')
-            ax.set_ylabel('Scaling Efficiency (%)')
-            ax.set_title('Zswap Benchmark: Linear Scaling Efficiency')
-            ax.legend(loc='lower left')
-            ax.grid(True, alpha=0.3)
-            ax.set_ylim(0, 110)
+        if ratios:
+            bars = ax.bar(range(len(labels)), ratios, color=colors)
+            ax.set_xticks(range(len(labels)))
+            ax.set_xticklabels(labels, fontsize=9)
+            ax.set_ylabel('Compression Ratio (stored/compressed)')
+            ax.set_title('Zswap Compression Ratio by Algorithm')
+            for bar, ratio in zip(bars, ratios):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+                        f'{ratio:.2f}x', ha='center', va='bottom', fontsize=10)
+            ax.grid(True, alpha=0.3, axis='y')
             fig.tight_layout()
-            fig.savefig(output_dir / 'scaling_efficiency.png', dpi=150)
+            fig.savefig(output_dir / 'compression_ratio.png', dpi=150)
             plt.close(fig)
 
-        # ---- 图4: 硬件 vs 软件对比 (deflate) ----
+        # ---- 图5: 硬件 vs 软件对比 (deflate) ----
         if 'deflate' in self.results and 'deflate-sw' in self.results:
-            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+            fig, axes = plt.subplots(1, 3, figsize=(20, 6))
 
-            # 性能对比
+            # 5a: memory 使用对比
             ax = axes[0]
             for algo, label, color in [('deflate-sw', 'Deflate (sw)', ALGO_COLORS['deflate-sw']),
                                         ('deflate', 'Deflate (HW)', ALGO_COLORS['deflate'])]:
                 results = sorted(self.results[algo], key=lambda x: x.threads)
-                if metric:
-                    threads = []
-                    values = []
-                    for r in results:
-                        v = getattr(r, metric)
-                        if v is not None:
-                            threads.append(r.threads)
-                            values.append(v)
-                    if threads:
-                        ax.plot(threads, values, 'o-', label=label, color=color, linewidth=2)
+                threads_list = [r.threads for r in results if r.peak_memory_mb is not None]
+                mem_vals = [r.peak_memory_mb for r in results if r.peak_memory_mb is not None]
+                if threads_list:
+                    ax.plot(threads_list, mem_vals, 'o-', label=label, color=color, linewidth=2)
+            ax.axhline(y=CGROUP_MEM_HIGH, color='red', linestyle=':', alpha=0.5)
             ax.set_xlabel('Threads')
-            ax.set_ylabel(metric_label)
-            ax.set_title('Deflate: Hardware vs Software (Performance)')
+            ax.set_ylabel('Peak Memory (MB)')
+            ax.set_title('Deflate: HW vs SW (Memory)')
             ax.legend()
             ax.grid(True, alpha=0.3)
 
-            # 压缩比对比
+            # 5b: swap 使用对比
             ax = axes[1]
             for algo, label, color in [('deflate-sw', 'Deflate (sw)', ALGO_COLORS['deflate-sw']),
                                         ('deflate', 'Deflate (HW)', ALGO_COLORS['deflate'])]:
                 results = sorted(self.results[algo], key=lambda x: x.threads)
-                threads = []
-                ratios = []
+                threads_list = [r.threads for r in results if r.peak_swap_mb is not None]
+                swap_vals = [r.peak_swap_mb for r in results if r.peak_swap_mb is not None]
+                if threads_list:
+                    ax.plot(threads_list, swap_vals, 'o-', label=label, color=color, linewidth=2)
+            ax.set_xlabel('Threads')
+            ax.set_ylabel('Peak Swap (MB)')
+            ax.set_title('Deflate: HW vs SW (Swap)')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            # 5c: 压缩比对比
+            ax = axes[2]
+            for algo, label, color in [('deflate-sw', 'Deflate (sw)', ALGO_COLORS['deflate-sw']),
+                                        ('deflate', 'Deflate (HW)', ALGO_COLORS['deflate'])]:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                threads_list = []
+                ratio_vals = []
                 for r in results:
-                    if r.compression_ratio is not None:
-                        threads.append(r.threads)
-                        ratios.append(r.compression_ratio)
-                if threads:
-                    ax.plot(threads, ratios, 'o-', label=label, color=color, linewidth=2)
+                    # 取每个线程数最终采样点的压缩比
+                    if r.samples:
+                        last = r.samples[-1]
+                        if last.compression_ratio is not None and last.zswap_compressed_pages > 0:
+                            threads_list.append(r.threads)
+                            ratio_vals.append(last.compression_ratio)
+                if threads_list:
+                    ax.plot(threads_list, ratio_vals, 'o-', label=label, color=color, linewidth=2)
             ax.set_xlabel('Threads')
             ax.set_ylabel('Compression Ratio')
-            ax.set_title('Deflate: Hardware vs Software (Compression Ratio)')
+            ax.set_title('Deflate: HW vs SW (Compression)')
             ax.legend()
             ax.grid(True, alpha=0.3)
 
             fig.tight_layout()
             fig.savefig(output_dir / 'hw_vs_sw_deflate.png', dpi=150)
+            plt.close(fig)
+
+        # ---- 图6: 各算法逐秒内存时间线对比 (最高线程数) ----
+        max_threads = 0
+        for algo in algos:
+            results = sorted(self.results[algo], key=lambda x: x.threads)
+            if results:
+                max_threads = max(max_threads, results[-1].threads)
+
+        if max_threads > 0:
+            fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
+
+            # 上图: memory.current
+            ax = axes[0]
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                r = next((x for x in reversed(results) if x.threads == max_threads and x.samples), None)
+                if r:
+                    times = [s.timestamp - r.samples[0].timestamp for s in r.samples]
+                    vals = [s.memory_mb for s in r.samples]
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(times, vals, '-', label=label, color=color, linewidth=1.5)
+            ax.axhline(y=CGROUP_MEM_HIGH, color='red', linestyle=':', alpha=0.5)
+            ax.set_ylabel('memory.current (MB)')
+            ax.set_title(f'All Algorithms @ {max_threads} threads: Memory Over Time')
+            ax.legend(loc='lower right', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+            # 下图: swap.current
+            ax = axes[1]
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                r = next((x for x in reversed(results) if x.threads == max_threads and x.samples), None)
+                if r:
+                    times = [s.timestamp - r.samples[0].timestamp for s in r.samples]
+                    vals = [s.swap_mb for s in r.samples]
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(times, vals, '-', label=label, color=color, linewidth=1.5)
+            ax.axhline(y=SWAP_SIZE, color='red', linestyle=':', alpha=0.5)
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('swap.current (MB)')
+            ax.set_title(f'All Algorithms @ {max_threads} threads: Swap Over Time')
+            ax.legend(loc='lower right', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+            fig.tight_layout()
+            fig.savefig(output_dir / f'all_algos_t{max_threads}_timeline.png', dpi=150)
             plt.close(fig)
 
         print(f"[INFO] Charts saved to {output_dir}")
@@ -583,32 +656,34 @@ class ZswapAnalyzer:
         data = {
             'generated_at': datetime.now().isoformat(),
             'results_dir': str(self.results_dir),
+            'phase_thresholds': {
+                'cgroup_high_mb': CGROUP_MEM_HIGH,
+                'swap_size_mb': SWAP_SIZE,
+            },
             'algorithms': {}
         }
 
         for algo in sorted(self.results.keys()):
             results = sorted(self.results[algo], key=lambda x: x.threads)
-            metric = 'bogo' if any(r.stress_bogo for r in results) else 'throughput'
             data['algorithms'][algo] = {
                 'label': ALGO_LABELS.get(algo, algo),
-                'linearity': self.calculate_linearity(algo, metric),
                 'tests': []
             }
 
             for r in results:
                 test_data = {
                     'threads': r.threads,
+                    'total_mem_mb': r.total_mem_mb,
+                    'expected_phase': r.expected_phase,
+                    'numa_policy': r.numa_policy,
+                    'peak_memory_mb': r.peak_memory_mb,
+                    'peak_swap_mb': r.peak_swap_mb,
+                    'compression_ratio': r.compression_ratio,
+                    'zswap_delta_mb': r.zswap_delta_mb,
                     'throughput': r.throughput,
                     'latency': r.latency,
-                    'stress_bogo_ops': r.stress_bogo,
-                    'stress_time': r.stress_time,
-                    'compression_ratio': r.compression_ratio,
-                    'stored_pages': r.stored_pages,
-                    'compressed_pages': r.compressed_pages,
-                    'pool_total_size': r.pool_total_size,
-                    'pool_limit_hit': r.pool_limit_hit,
-                    'reject_compress_poor': r.reject_compress_poor,
-                    'reject_alloc_fail': r.reject_alloc_fail,
+                    'num_samples': len(r.samples),
+                    'zswap_post': r.zswap_post,
                 }
                 data['algorithms'][algo]['tests'].append(test_data)
 
