@@ -72,12 +72,33 @@ class PhaseSample:
         return None
 
 
+class LlamaPhaseSample:
+    """llama-bench 多进程测试的采样点"""
+    __slots__ = ['timestamp', 'memory_current', 'swap_current', 'running_instances']
+
+    def __init__(self, row: dict):
+        self.timestamp = float(row['timestamp'])
+        self.memory_current = int(row['memory_current'])
+        self.swap_current = int(row['swap_current'])
+        self.running_instances = int(row.get('running_instances', '0'))
+
+    @property
+    def memory_mb(self) -> int:
+        return self.memory_current // (1024 * 1024)
+
+    @property
+    def swap_mb(self) -> int:
+        return self.swap_current // (1024 * 1024)
+
+
 class TestResult:
     """单个 algo+threads 测试结果"""
     def __init__(self, algo: str, threads: int):
         self.algo = algo
         self.threads = threads
         self.samples: List[PhaseSample] = []
+        # llama-bench 多进程采样
+        self.llama_samples: List[LlamaPhaseSample] = []
         # 元数据 (从 memtest_*.log 头部解析)
         self.total_mem_mb: Optional[int] = None
         self.expected_phase: Optional[str] = None
@@ -103,9 +124,17 @@ class TestResult:
         self.child_sys_sec: Optional[float] = None
         self.business_pct: Optional[float] = None
         self.compression_pct: Optional[float] = None
-        # llama-bench CPU (从 bench log 解析)
+        # llama-bench 多进程指标
         self.llama_user_ms: Optional[int] = None
         self.llama_sys_ms: Optional[int] = None
+        self.llama_instances: Optional[int] = None
+        self.llama_total_model_mem_mb: Optional[int] = None
+        self.llama_successful_instances: Optional[int] = None
+        # llama 各实例 eval tokens/s
+        self.llama_eval_rates: List[float] = []
+        # llama 内存压力峰值
+        self.llama_peak_memory_mb: Optional[int] = None
+        self.llama_peak_swap_mb: Optional[int] = None
 
     @property
     def peak_memory_mb(self) -> Optional[int]:
@@ -172,13 +201,34 @@ class ZswapAnalyzer:
         if not filepath.exists():
             return None
 
-        # 从文件名提取: phase_algo_tN.log
+        # 从文件名提取: phase_algo_tN.log 或 phase_llama_algo_tN.log
         filename = filepath.stem
-        parts = filename.split('_')
-        if len(parts) < 3:
-            return None
-        algo = parts[1]
-        threads = int(parts[2].replace('t', ''))
+        is_llama = filename.startswith('phase_llama_')
+
+        if is_llama:
+            # phase_llama_algo_tN.log
+            rest = filename[len('phase_llama_'):]
+            parts = rest.split('_')
+            if len(parts) < 2:
+                return None
+            # 找到 't' 开头的部分作为 threads
+            algo_parts = []
+            threads = None
+            for p in parts:
+                if p.startswith('t') and p[1:].isdigit():
+                    threads = int(p[1:])
+                    break
+                algo_parts.append(p)
+            if threads is None:
+                return None
+            algo = '_'.join(algo_parts)
+        else:
+            # phase_algo_tN.log
+            parts = filename.split('_')
+            if len(parts) < 3:
+                return None
+            algo = parts[1]
+            threads = int(parts[2].replace('t', ''))
 
         result = TestResult(algo, threads)
 
@@ -186,11 +236,14 @@ class ZswapAnalyzer:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
-                    result.samples.append(PhaseSample(row))
+                    if is_llama:
+                        result.llama_samples.append(LlamaPhaseSample(row))
+                    else:
+                        result.samples.append(PhaseSample(row))
                 except (ValueError, KeyError):
                     continue
 
-        if not result.samples:
+        if not result.samples and not result.llama_samples:
             return None
 
         return result
@@ -263,7 +316,7 @@ class ZswapAnalyzer:
             except ValueError:
                 pass
 
-    # ---- 解析 llama-bench 输出 ----
+    # ---- 解析 llama-bench 多进程输出 ----
     def parse_bench_log(self, filepath: Path):
         if not filepath.exists():
             return
@@ -278,20 +331,53 @@ class ZswapAnalyzer:
 
         result = self._find_or_create(algo, threads)
 
-        m = re.search(r'tokens per second:\s*([\d.]+)', content)
+        # 多实例元数据
+        m = re.search(r'Concurrent_Instances:\s+(\d+)', content)
         if m:
-            result.throughput = float(m.group(1))
-        m = re.search(r'eval time:\s*([\d.]+)', content)
+            result.llama_instances = int(m.group(1))
+        m = re.search(r'Total_Model_Mem_MB:\s+(\d+)', content)
         if m:
-            result.latency = float(m.group(1))
+            result.llama_total_model_mem_mb = int(m.group(1))
+        m = re.search(r'Successful_Instances:\s+(\d+)\s*/\s*\d+', content)
+        if m:
+            result.llama_successful_instances = int(m.group(1))
 
-        # llama CPU usage from cgroup delta
+        # CPU usage
         m = re.search(r'llama_user_ms:\s+(\d+)', content)
         if m:
             result.llama_user_ms = int(m.group(1))
         m = re.search(r'llama_sys_ms:\s+(\d+)', content)
         if m:
             result.llama_sys_ms = int(m.group(1))
+
+        # 提取各实例的 eval tokens/s
+        # llama-bench 输出格式: | model | size | params | backend | ngl | test | t/s |
+        # 匹配每实例输出中最后一行数据行的 t/s 值
+        eval_rates = []
+        inst_blocks = re.split(r'---\s*Instance\s*\d+\s*---', content)
+        for block in inst_blocks[1:]:  # skip text before first instance
+            # llama-bench 输出的最后一行通常包含 eval rate
+            # 匹配格式如: "qwen2 ...  123.45 ± 2.34" 或简单的数字行
+            lines = block.strip().splitlines()
+            for line in reversed(lines):
+                # llama-bench table output: last numeric column
+                nums = re.findall(r'(\d+\.\d+)', line)
+                if nums:
+                    try:
+                        eval_rates.append(float(nums[-1]))
+                        break
+                    except ValueError:
+                        pass
+
+        if eval_rates:
+            result.llama_eval_rates = eval_rates
+            # 平均 eval rate 作为 throughput
+            result.throughput = sum(eval_rates) / len(eval_rates)
+
+        # 从 llama phase samples 计算峰值
+        if result.llama_samples:
+            result.llama_peak_memory_mb = max(s.memory_mb for s in result.llama_samples)
+            result.llama_peak_swap_mb = max(s.swap_mb for s in result.llama_samples)
 
     # ---- 解析 zswap pre/post 快照 ----
     def parse_zswap_snapshot(self, filepath: Path):
@@ -499,24 +585,46 @@ class ZswapAnalyzer:
                              f"{limit:<12} {rej_poor:<12} {rej_alloc:<12}")
             lines.append("")
 
-        # ---- 6. llama-bench 结果 (可选) ----
-        has_tps = any(r.throughput for algo in self.results.values() for r in algo)
-        if has_tps:
+        # ---- 6. llama-bench 多进程结果 ----
+        has_llama = any(r.llama_instances for algo in self.results.values() for r in algo)
+        if has_llama:
             lines.append("=" * 80)
-            lines.append("  6. llama-bench 结果")
+            lines.append("  6. llama-bench 多进程内存压力测试")
             lines.append("=" * 80)
             lines.append("")
-            lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Tokens/s':<15} {'Latency(ms)':<12}")
-            lines.append("-" * 80)
+            lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Instances':<12} "
+                         f"{'Total Mem':<14} {'Phase':<16} {'Avg t/s':<12} {'Success':<10}")
+            lines.append("-" * 92)
             for algo in sorted(self.results.keys()):
                 results = sorted(self.results[algo], key=lambda x: x.threads)
                 label = ALGO_LABELS.get(algo, algo)
                 for r in results:
-                    if r.throughput:
-                        tps = f"{r.throughput:.1f}"
-                        lat = f"{r.latency:.1f}" if r.latency else "N/A"
-                        lines.append(f"{label:<18} {r.threads:<10} {tps:<15} {lat:<12}")
-            lines.append("")
+                    if r.llama_instances:
+                        inst = f"{r.llama_instances}"
+                        total = f"{r.llama_total_model_mem_mb}MB" if r.llama_total_model_mem_mb else "N/A"
+                        phase = r.expected_phase or self.classify_phase(r.llama_total_model_mem_mb or 0)
+                        avg_ts = f"{r.throughput:.1f}" if r.throughput else "N/A"
+                        succ = f"{r.llama_successful_instances}/{r.llama_instances}" if r.llama_successful_instances else "N/A"
+                        lines.append(f"{label:<18} {r.threads:<10} {inst:<12} "
+                                     f"{total:<14} {phase:<16} {avg_ts:<12} {succ:<10}")
+                lines.append("")
+
+            # llama-bench 内存压力峰值
+            lines.append(f"{'Algorithm':<18} {'Threads':<10} {'Instances':<12} "
+                         f"{'Peak Mem':<14} {'Peak Swap':<14} {'User(ms)':<12} {'Sys(ms)':<12}")
+            lines.append("-" * 92)
+            for algo in sorted(self.results.keys()):
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                label = ALGO_LABELS.get(algo, algo)
+                for r in results:
+                    if r.llama_instances:
+                        pm = f"{r.llama_peak_memory_mb}MB" if r.llama_peak_memory_mb else "N/A"
+                        ps = f"{r.llama_peak_swap_mb}MB" if r.llama_peak_swap_mb else "N/A"
+                        lu = f"{r.llama_user_ms}" if r.llama_user_ms else "N/A"
+                        ls = f"{r.llama_sys_ms}" if r.llama_sys_ms else "N/A"
+                        lines.append(f"{label:<18} {r.threads:<10} {r.llama_instances:<12} "
+                                     f"{pm:<14} {ps:<14} {lu:<12} {ls:<12}")
+                lines.append("")
 
         lines.append("=" * 80)
         return "\n".join(lines)
@@ -855,6 +963,78 @@ class ZswapAnalyzer:
             fig.savefig(output_dir / f'all_algos_t{max_threads}_timeline.png', dpi=150)
             plt.close(fig)
 
+        # ---- 图10: llama-bench 多进程内存压力时间线 ----
+        has_llama_phase = any(
+            r.llama_samples for algo in algos for r in self.results[algo]
+        )
+        if has_llama_phase:
+            fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
+
+            ax = axes[0]
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                for r in results:
+                    if r.llama_samples:
+                        times = [s.timestamp - r.llama_samples[0].timestamp
+                                 for s in r.llama_samples]
+                        mem_vals = [s.memory_mb for s in r.llama_samples]
+                        color = ALGO_COLORS.get(algo, 'gray')
+                        label = f"{ALGO_LABELS.get(algo, algo)} ({r.threads}T, {r.llama_instances}inst)"
+                        ax.plot(times, mem_vals, '-', label=label, color=color, linewidth=1.5)
+            ax.axhline(y=CGROUP_MEM_HIGH, color='red', linestyle=':', alpha=0.5,
+                       label=f'cgroup high ({CGROUP_MEM_HIGH}MB)')
+            ax.set_ylabel('memory.current (MB)')
+            ax.set_title('llama-bench Multi-Instance: Memory Over Time')
+            ax.legend(loc='lower right', fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+            ax = axes[1]
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                for r in results:
+                    if r.llama_samples:
+                        times = [s.timestamp - r.llama_samples[0].timestamp
+                                 for s in r.llama_samples]
+                        swap_vals = [s.swap_mb for s in r.llama_samples]
+                        color = ALGO_COLORS.get(algo, 'gray')
+                        label = f"{ALGO_LABELS.get(algo, algo)} ({r.threads}T, {r.llama_instances}inst)"
+                        ax.plot(times, swap_vals, '-', label=label, color=color, linewidth=1.5)
+            ax.axhline(y=SWAP_SIZE, color='red', linestyle=':', alpha=0.5,
+                       label=f'swap limit ({SWAP_SIZE}MB)')
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('swap.current (MB)')
+            ax.set_title('llama-bench Multi-Instance: Swap Over Time')
+            ax.legend(loc='lower right', fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+            fig.tight_layout()
+            fig.savefig(output_dir / 'llama_memory_pressure_timeline.png', dpi=150)
+            plt.close(fig)
+
+        # ---- 图11: llama-bench eval rate vs instances ----
+        has_eval = any(
+            r.llama_eval_rates for algo in algos for r in self.results[algo]
+        )
+        if has_eval:
+            fig, ax = plt.subplots(figsize=(14, 8))
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                ts = [r.threads for r in results if r.llama_eval_rates]
+                rates = [sum(r.llama_eval_rates) / len(r.llama_eval_rates)
+                         for r in results if r.llama_eval_rates]
+                if ts:
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(ts, rates, 'o-', label=label, color=color, linewidth=2)
+            ax.set_xlabel('Threads (total)')
+            ax.set_ylabel('Avg Eval Rate (tokens/s per instance)')
+            ax.set_title('llama-bench: Inference Throughput vs Memory Pressure')
+            ax.legend(loc='upper right')
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(output_dir / 'llama_eval_vs_threads.png', dpi=150)
+            plt.close(fig)
+
         print(f"[INFO] Charts saved to {output_dir}")
 
     # ---- JSON 导出 ----
@@ -901,9 +1081,16 @@ class ZswapAnalyzer:
                     'compression_pct': r.compression_pct,
                     'llama_user_ms': r.llama_user_ms,
                     'llama_sys_ms': r.llama_sys_ms,
+                    'llama_instances': r.llama_instances,
+                    'llama_total_model_mem_mb': r.llama_total_model_mem_mb,
+                    'llama_successful_instances': r.llama_successful_instances,
+                    'llama_eval_rates': r.llama_eval_rates,
+                    'llama_peak_memory_mb': r.llama_peak_memory_mb,
+                    'llama_peak_swap_mb': r.llama_peak_swap_mb,
                     'throughput': r.throughput,
                     'latency': r.latency,
                     'num_samples': len(r.samples),
+                    'num_llama_samples': len(r.llama_samples),
                     'zswap_post': r.zswap_post,
                 }
                 data['algorithms'][algo]['tests'].append(test_data)

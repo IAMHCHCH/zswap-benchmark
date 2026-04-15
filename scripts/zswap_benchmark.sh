@@ -690,66 +690,216 @@ run_memtest() {
     log_info "内存压力测试完成: algo=$algo, threads=$threads, 耗时=${elapsed}s"
 }
 
-# ========== llama.cpp 基准测试 (可选) ==========
+# ========== llama.cpp 基准测试 (多进程内存压力) ==========
+#
+# 设计思路:
+#   启动 N 个并发 llama-bench 进程，每个进程独立加载模型到内存。
+#   通过进程数控制总内存占用: N × model_size
+#   随进程数增长自然经历三阶段: 无 swap → zswap 压缩 → swap 满载
+#
+# 示例 (model ~5GB, cgroup high=16G, swap=16G):
+#   1 进程  →  5GB  < 16G   → 无 swap
+#   3 进程  → 15GB  ≈ 16G   → 接近触发 zswap
+#   4 进程  → 20GB  > 16G   → zswap 压缩 + swap 写入
+#   7 进程  → 35GB  > 32G   → swap 满载
+#
 run_llama_bench() {
     local algo=$1
     local threads=$2
     local outfile="$RESULT_DIR/bench_${algo}_t${threads}.log"
+    local phasefile="$RESULT_DIR/phase_llama_${algo}_t${threads}.log"
 
     if [ $LLAMA_BENCH_AVAILABLE -eq 0 ]; then
         return
     fi
 
-    log_info "运行 llama-bench: algo=$algo, threads=$threads"
+    if [ ! -f "$MODEL" ]; then
+        log_info "  模型文件不存在，跳过 llama-bench: $MODEL"
+        return
+    fi
 
+    # ---- 计算并发实例数 ----
+    # 目标: N 个实例 × model_size ≈ threads × PER_THREAD_MEM
+    # 使 llama-bench 独立构造与 memtest 相同量级的内存压力
+    local model_size_bytes
+    model_size_bytes=$(stat -c %s "$MODEL" 2>/dev/null || echo "0")
+    local model_size_mb=$((model_size_bytes / 1024 / 1024))
+
+    if [ "$model_size_bytes" -eq 0 ]; then
+        log_warn "  无法获取模型文件大小，使用 1 个实例"
+        model_size_mb=1024  # 保守估计 1GB
+    fi
+
+    local per_thread_bytes
+    per_thread_bytes=$(mem_to_bytes "$PER_THREAD_MEM")
+    local total_target_mb=$((per_thread_bytes * threads / 1024 / 1024))
+
+    # num_instances = ceil(total_target / model_size), 至少 1
+    local num_instances=1
+    if [ "$model_size_mb" -gt 0 ]; then
+        num_instances=$(( (total_target_mb + model_size_mb - 1) / model_size_mb ))
+    fi
+    [ "$num_instances" -lt 1 ] && num_instances=1
+    [ "$num_instances" -gt 32 ] && num_instances=32
+
+    # 每个实例分配的线程数 (均匀分配)
+    local threads_per_instance=$((threads / num_instances))
+    [ "$threads_per_instance" -lt 1 ] && threads_per_instance=1
+
+    local total_model_mem_mb=$((num_instances * model_size_mb))
+    local cgroup_high_mb
+    cgroup_high_mb=$(($(mem_to_bytes "$CGROUP_MEM_HIGH") / 1024 / 1024))
+    local swap_size_mb
+    swap_size_mb=$(($(mem_to_bytes "$SWAPFILE_SIZE") / 1024 / 1024))
+
+    # 判断预期阶段
+    local expected_phase="无 swap"
+    local total_capacity=$((cgroup_high_mb + swap_size_mb))
+    if [ "$total_model_mem_mb" -ge "$cgroup_high_mb" ]; then
+        expected_phase="zswap 压缩"
+    fi
+    if [ "$total_model_mem_mb" -ge "$total_capacity" ]; then
+        expected_phase="swap 满载"
+    fi
+
+    log_info "运行 llama-bench (多进程): algo=$algo, threads=$threads"
+    log_info "  并发实例: $num_instances, 每实例线程: $threads_per_instance"
+    log_info "  模型大小: ${model_size_mb}MB, 总模型内存: ${total_model_mem_mb}MB"
+    log_info "  预期阶段: $expected_phase"
+
+    # ---- 确保当前 shell 在 cgroup 中 ----
     echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
 
+    # ---- 写入测试头 ----
     {
-        echo "=== Llama Benchmark ==="
+        echo "=== Llama Benchmark (Multi-Instance Memory Pressure) ==="
         echo "Algorithm: $algo"
         echo "Threads: $threads"
-        echo "Memory Limit: $CGROUP_MEM_HIGH"
+        echo "Concurrent_Instances: $num_instances"
+        echo "Threads_Per_Instance: $threads_per_instance"
         echo "Model: $MODEL"
-        echo "Prompt Length: $PROMPT_LEN"
-        echo "Generate Length: $GEN_LEN"
+        echo "Model_Size_MB: $model_size_mb"
+        echo "Total_Model_Mem_MB: $total_model_mem_mb"
+        echo "Cgroup_High_MB: $cgroup_high_mb"
+        echo "Swap_Size_MB: $swap_size_mb"
+        echo "Expected_Phase: $expected_phase"
+        echo "Prompt_Len: $PROMPT_LEN"
+        echo "Gen_Len: $GEN_LEN"
         echo "Iterations: $ITERATIONS"
         echo "Timestamp: $(date)"
         echo ""
-        echo "=== Output ==="
+    } > "$outfile"
+
+    # ---- 采样 CSV 头 ----
+    echo "timestamp,memory_current,swap_current,running_instances" > "$phasefile"
+
+    # ---- cgroup CPU 计数 (前) ----
+    local cpu_user_before=0 cpu_sys_before=0
+    if [ -f "$CGROUP_DIR/cpu.stat" ]; then
+        cpu_user_before=$(grep "^user_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
+        cpu_sys_before=$(grep "^system_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
+    fi
+
+    # ---- 启动 N 个并发 llama-bench 实例 ----
+    local pids=()
+    local inst_outfiles=()
+    for i in $(seq 1 "$num_instances"); do
+        local inst_out="$RESULT_DIR/_llama_inst${i}.log"
+        inst_outfiles+=("$inst_out")
+        llama-bench \
+            -m "$MODEL" \
+            -p "$PROMPT_LEN" \
+            -n "$GEN_LEN" \
+            -t "$threads_per_instance" \
+            -r "$ITERATIONS" \
+            > "$inst_out" 2>&1 &
+        pids+=($!)
+    done
+
+    log_info "  已启动 $num_instances 个实例: PIDs ${pids[*]}"
+
+    # ---- 监控 memory/swap 直到所有实例完成 ----
+    local max_wait=600
+    local waited=0
+
+    while [ "$waited" -lt "$max_wait" ]; do
+        local running=0
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                running=$((running + 1))
+            fi
+        done
+
+        local mem_now swap_now ts
+        mem_now=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null || echo "0")
+        swap_now=$(cat "$CGROUP_DIR/memory.swap.current" 2>/dev/null || echo "0")
+        ts=$(date +%s)
+        echo "$ts,$mem_now,$swap_now,$running" >> "$phasefile"
+
+        # 每 10 秒打印一次进度
+        if [ $((waited % 10)) -eq 0 ]; then
+            local mem_mb=$((mem_now / 1024 / 1024))
+            local swap_mb=$((swap_now / 1024 / 1024))
+            log_info "  [${waited}s] memory=${mem_mb}MB, swap=${swap_mb}MB, running=${running}/${num_instances}"
+        fi
+
+        if [ "$running" -eq 0 ]; then
+            break
+        fi
+
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # ---- 等待残留实例 ----
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    # ---- cgroup CPU 计数 (后) ----
+    local cpu_user_after=0 cpu_sys_after=0
+    if [ -f "$CGROUP_DIR/cpu.stat" ]; then
+        cpu_user_after=$(grep "^user_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
+        cpu_sys_after=$(grep "^system_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
+    fi
+    local llama_user_ms=$(( (cpu_user_after - cpu_user_before) / 1000 ))
+    local llama_sys_ms=$(( (cpu_sys_after - cpu_sys_before) / 1000 ))
+
+    # ---- 汇总各实例结果 ----
+    {
+        echo ""
+        echo "=== Aggregated Results ==="
+        echo "Concurrent_Instances: $num_instances"
+        echo "Total_Model_Mem_MB: $total_model_mem_mb"
+        echo "llama_user_ms: $llama_user_ms"
+        echo "llama_sys_ms: $llama_sys_ms"
+        echo ""
+        echo "=== Per-Instance Output ==="
+        local success_count=0
+        for i in $(seq 1 "$num_instances"); do
+            local f="${inst_outfiles[$((i-1))]}"
+            if [ -f "$f" ]; then
+                echo "--- Instance $i (PID ${pids[$((i-1))]}) ---"
+                cat "$f"
+                echo ""
+                # 统计成功实例数 (llama-bench 正常退出会产生包含数字的输出)
+                if grep -qE '^[0-9]+' "$f" 2>/dev/null; then
+                    success_count=$((success_count + 1))
+                fi
+            else
+                echo "--- Instance $i: output file missing ---"
+            fi
+        done
+        echo ""
+        echo "Successful_Instances: $success_count / $num_instances"
     } >> "$outfile"
 
-    echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
+    # 清理临时文件
+    for f in "${inst_outfiles[@]}"; do
+        rm -f "$f" 2>/dev/null
+    done
 
-    # 记录 llama-bench 运行前的 cgroup CPU
-    local llama_cpu_user_before=0
-    local llama_cpu_sys_before=0
-    if [ -f "$CGROUP_DIR/cpu.stat" ]; then
-        llama_cpu_user_before=$(grep "^user_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
-        llama_cpu_sys_before=$(grep "^system_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
-    fi
-
-    llama-bench \
-        -m "$MODEL" \
-        -p $PROMPT_LEN \
-        -n $GEN_LEN \
-        -t $threads \
-        -r $ITERATIONS \
-        2>&1 | tee -a "$outfile"
-
-    # 记录 llama-bench 运行后的 cgroup CPU, 计算增量
-    if [ -f "$CGROUP_DIR/cpu.stat" ]; then
-        local llama_cpu_user_after=$(grep "^user_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
-        local llama_cpu_sys_after=$(grep "^system_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
-        local llama_user_ms=$(( (llama_cpu_user_after - llama_cpu_user_before) / 1000 ))
-        local llama_sys_ms=$(( (llama_cpu_sys_after - llama_cpu_sys_before) / 1000 ))
-        {
-            echo ""
-            echo "=== Llama CPU Usage (cgroup delta) ==="
-            echo "llama_user_ms: $llama_user_ms"
-            echo "llama_sys_ms: $llama_sys_ms"
-        } >> "$outfile"
-        log_info "  llama CPU: user=${llama_user_ms}ms, sys=${llama_sys_ms}ms"
-    fi
+    log_info "  llama-bench 完成: user=${llama_user_ms}ms, sys=${llama_sys_ms}ms, 成功=${success_count:-?}/${num_instances}"
 }
 
 # ========== 主测试循环 ==========
@@ -898,6 +1048,29 @@ generate_summary() {
                         echo "    Compression Ratio:   ${ratio}x" >> "$summary_file"
                     fi
                 fi
+            fi
+
+            # ---- llama-bench 多进程指标 ----
+            local bench_file="$RESULT_DIR/bench_${algo}_t${t}.log"
+            if [ -f "$bench_file" ]; then
+                local bench_instances=$(grep "^Concurrent_Instances:" "$bench_file" 2>/dev/null | awk '{print $2}')
+                local bench_total_mem=$(grep "^Total_Model_Mem_MB:" "$bench_file" 2>/dev/null | awk '{print $2}')
+                local bench_success=$(grep "^Successful_Instances:" "$bench_file" 2>/dev/null | awk '{print $2}')
+                local bench_user=$(grep "^llama_user_ms:" "$bench_file" 2>/dev/null | awk '{print $2}')
+                local bench_sys=$(grep "^llama_sys_ms:" "$bench_file" 2>/dev/null | awk '{print $2}')
+
+                echo "    [llama-bench]" >> "$summary_file"
+                [ -n "$bench_instances" ] && echo "      Instances:         ${bench_instances}" >> "$summary_file"
+                [ -n "$bench_total_mem" ] && echo "      Total Model Mem:   ${bench_total_mem} MB" >> "$summary_file"
+                [ -n "$bench_success" ] && echo "      Successful:        ${bench_success}" >> "$summary_file"
+                [ -n "$bench_user" ] && echo "      User CPU:          ${bench_user} ms" >> "$summary_file"
+                [ -n "$bench_sys" ] && echo "      Sys CPU:           ${bench_sys} ms" >> "$summary_file"
+
+                # 提取各实例的 eval tokens/s (llama-bench 输出的最后一列通常包含速率)
+                local inst_tokens=""
+                inst_tokens=$(grep -A 100 "Per-Instance Output" "$bench_file" 2>/dev/null | \
+                    grep -oP '[\d.]+(?=\s*tokens\s*/\s*sec|\s*t/s)' | head -1)
+                [ -n "$inst_tokens" ] && echo "      Eval Rate:         ${inst_tokens} tokens/s (per instance)" >> "$summary_file"
             fi
 
             # 提取 zswap 前后差异
