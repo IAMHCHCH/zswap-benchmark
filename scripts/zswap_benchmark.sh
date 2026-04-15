@@ -21,6 +21,7 @@ ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 
 TEST_DURATION=30                     # 每组测试持续时间 (秒)
 SAMPLE_INTERVAL=1                    # 采样间隔 (秒)
 MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"   # 测试模型路径 (需下载 GGUF 模型, 留空则跳过)
+DATA_SOURCE=""                                 # 内存填充数据源 (留空=固定模式0xAA, 指定文件路径如 silesia.tar 则循环填充真实数据)
 PROMPT_LEN=512                       # prompt 长度
 GEN_LEN=128                          # 生成长度
 ITERATIONS=3                         # 每组测试次数
@@ -354,6 +355,16 @@ def main():
     duration = int(sys.argv[3])
     phasefile = sys.argv[4]
     cgroup_dir = sys.argv[5]
+    data_source = sys.argv[6] if len(sys.argv) > 6 else ''
+
+    # Pre-load data source for real-data filling
+    fill_data = None
+    if data_source and os.path.isfile(data_source):
+        with open(data_source, 'rb') as f:
+            fill_data = f.read()
+        print(f'  数据源: {data_source} ({len(fill_data)} bytes)', flush=True)
+    elif data_source:
+        print(f'  [WARN] 数据源不存在, 使用固定模式: {data_source}', flush=True)
 
     # ============================================================
     # Phase 1: Fork children, allocate memory, measure throughput
@@ -373,8 +384,21 @@ def main():
                 t0 = time.time()
                 buf = mmap.mmap(-1, per_thread)
                 page_size = 4096
-                for offset in range(0, per_thread, page_size):
-                    buf[offset] = 0xAA
+                if fill_data and len(fill_data) > 0:
+                    # Fill with real data, repeating to cover the full allocation
+                    data_len = len(fill_data)
+                    # Write in large chunks via slice assignment (much faster than byte-by-byte)
+                    # First, create a repeating pattern that covers at least per_thread bytes
+                    if data_len >= per_thread:
+                        buf[:] = fill_data[:per_thread]
+                    else:
+                        repeats = (per_thread // data_len) + 1
+                        big_data = (fill_data * repeats)[:per_thread]
+                        buf[:] = big_data
+                else:
+                    # Default: fixed pattern 0xAA
+                    for offset in range(0, per_thread, page_size):
+                        buf[offset] = 0xAA
                 t1 = time.time()
                 wt = t1 - t0
                 tp = (per_thread / 1024) / wt if wt > 0 else 0
@@ -645,6 +669,13 @@ run_memtest() {
     echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
 
     # 写入测试头信息
+    local data_source_info="固定模式(0xAA)"
+    if [ -n "$DATA_SOURCE" ] && [ -f "$DATA_SOURCE" ]; then
+        data_source_info="$DATA_SOURCE ($(stat -c %s "$DATA_SOURCE" 2>/dev/null || echo '?') bytes)"
+    elif [ -n "$DATA_SOURCE" ]; then
+        data_source_info="$DATA_SOURCE (文件不存在, 回退固定模式)"
+    fi
+
     {
         echo "=== Memory Stress Test ==="
         echo "Algorithm: $algo"
@@ -655,6 +686,7 @@ run_memtest() {
         echo "Swap_Size: ${swap_size_mb}MB"
         echo "Expected_Phase: $expected_phase"
         echo "NUMA_Policy: $numa_prefix"
+        echo "Data_Source: $data_source_info"
         echo "Duration: ${TEST_DURATION}s"
         echo "Timestamp: $(date)"
         echo ""
@@ -671,7 +703,7 @@ run_memtest() {
 
     # 启动内存压力测试 (独立 Python 脚本, 避免内联引号问题)
     $numa_prefix python3 "$RESULT_DIR/_memtest_runner.py" \
-        "$per_thread_bytes" "$threads" "$TEST_DURATION" "$phasefile" "$CGROUP_DIR" \
+        "$per_thread_bytes" "$threads" "$TEST_DURATION" "$phasefile" "$CGROUP_DIR" "$DATA_SOURCE" \
         2>&1 | tee -a "$outfile"
 
     local end_ts=$(date +%s)
@@ -802,7 +834,60 @@ run_llama_bench() {
         cpu_sys_before=$(grep "^system_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
     fi
 
-    # ---- 启动 N 个并发 llama-bench 实例 ----
+    # ---- Phase 1: 预加载模型文件制造内存压力 ----
+    # llama-bench mmap 加载模型时只会 page-in 推理访问的部分
+    # 所以先启动 N 个 mmap+read 进程强制全量读入模型文件
+    # 这些 "填充进程" 占住内存, 让 llama-bench 在压力下运行
+    log_info "  Phase 1: 预加载 $num_instances 份模型文件到内存..."
+    local preloader_pids=()
+    for i in $(seq 1 "$num_instances"); do
+        python3 -c "
+import mmap, os, sys
+fd = os.open('$MODEL', os.O_RDONLY)
+buf = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+# 强制 page-in: 顺序读取每 4KB 的第一个字节
+page_size = 4096
+total = len(buf)
+for off in range(0, total, page_size):
+    buf[off]
+os.close(fd)
+# 持有 mmap 不释放, 等待 stdin 关闭
+import sys
+sys.stdin.read()
+" &
+        preloader_pids+=($!)
+    done
+
+    # 等待预加载完成 (检测 memory.current 是否接近预期)
+    local preload_wait=0
+    local preload_target=$((model_size_mb * num_instances * 90 / 100))  # 90% of target
+    while [ "$preload_wait" -lt 120 ]; do
+        local mem_now=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null || echo "0")
+        local mem_now_mb=$((mem_now / 1024 / 1024))
+        if [ "$mem_now_mb" -ge "$preload_target" ] 2>/dev/null; then
+            log_info "  预加载完成: memory=${mem_now_mb}MB (目标 ${preload_target}MB)"
+            break
+        fi
+        if [ $((preload_wait % 10)) -eq 0 ]; then
+            log_info "  预加载中... [${preload_wait}s] memory=${mem_now_mb}MB"
+        fi
+        sleep 2
+        preload_wait=$((preload_wait + 2))
+    done
+
+    # 采样: 预加载后的内存状态
+    {
+        local mem_now=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null || echo "0")
+        local swap_now=$(cat "$CGROUP_DIR/memory.swap.current" 2>/dev/null || echo "0")
+        local ts=$(date +%s)
+        echo "$ts,$mem_now,$swap_now,$num_instances" >> "$phasefile"
+        local mem_mb=$((mem_now / 1024 / 1024))
+        local swap_mb=$((swap_now / 1024 / 1024))
+        log_info "  [预加载完成] memory=${mem_mb}MB, swap=${swap_mb}MB"
+    }
+
+    # ---- Phase 2: 在内存压力下启动 llama-bench 推理 ----
+    log_info "  Phase 2: 启动 llama-bench 推理 (压力环境下)..."
     local pids=()
     local inst_outfiles=()
     for i in $(seq 1 "$num_instances"); do
@@ -853,7 +938,7 @@ run_llama_bench() {
         waited=$((waited + 1))
     done
 
-    # ---- 等待残留实例 ----
+    # ---- 等待残留 llama-bench 实例 ----
     for pid in "${pids[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
@@ -866,6 +951,15 @@ run_llama_bench() {
     fi
     local llama_user_ms=$(( (cpu_user_after - cpu_user_before) / 1000 ))
     local llama_sys_ms=$(( (cpu_sys_after - cpu_sys_before) / 1000 ))
+
+    # ---- Phase 3: 清理预加载进程, 释放内存 ----
+    for pid in "${preloader_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${preloader_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    log_info "  预加载进程已清理"
 
     # ---- 汇总各实例结果 ----
     {
