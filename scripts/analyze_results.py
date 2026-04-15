@@ -48,14 +48,16 @@ SWAP_SIZE = 16 * 1024         # 16G in MB
 class PhaseSample:
     """单个采样点"""
     __slots__ = ['timestamp', 'memory_current', 'swap_current',
-                 'zswap_stored_pages', 'zswap_compressed_pages']
+                 'zswap_stored_pages', 'zswap_pool_total_size']
 
     def __init__(self, row: dict):
         self.timestamp = float(row['timestamp'])
         self.memory_current = int(row['memory_current'])
         self.swap_current = int(row['swap_current'])
         self.zswap_stored_pages = int(row.get('zswap_stored_pages', '0'))
-        self.zswap_compressed_pages = int(row.get('zswap_compressed_pages', '0'))
+        # 兼容旧格式 zswap_compressed_pages 和新格式 zswap_pool_total_size
+        pool_key = 'zswap_pool_total_size' if 'zswap_pool_total_size' in row else 'zswap_compressed_pages'
+        self.zswap_pool_total_size = int(row.get(pool_key, '0'))
 
     @property
     def memory_mb(self) -> int:
@@ -67,8 +69,9 @@ class PhaseSample:
 
     @property
     def compression_ratio(self) -> Optional[float]:
-        if self.zswap_compressed_pages > 0:
-            return self.zswap_stored_pages / self.zswap_compressed_pages
+        """stored_pages * 4096 / pool_total_size"""
+        if self.zswap_pool_total_size > 0 and self.zswap_stored_pages > 0:
+            return (self.zswap_stored_pages * 4096) / self.zswap_pool_total_size
         return None
 
 
@@ -155,10 +158,10 @@ class TestResult:
         return max(s.zswap_stored_pages for s in self.samples)
 
     @property
-    def peak_compressed_pages(self) -> Optional[int]:
+    def peak_pool_total_size(self) -> Optional[int]:
         if not self.samples:
             return None
-        return max(s.zswap_compressed_pages for s in self.samples)
+        return max(s.zswap_pool_total_size for s in self.samples)
 
     @property
     def compression_ratio(self) -> Optional[float]:
@@ -397,9 +400,10 @@ class ZswapAnalyzer:
         result = self._find_or_create(algo, threads)
 
         stats = {}
-        for key in ['stored_pages', 'compressed_pages', 'pool_total_size',
+        for key in ['stored_pages', 'pool_total_size',
                      'pool_limit_hit', 'reject_compress_poor', 'reject_alloc_fail']:
-            m = re.search(rf'^{key}\s+(\d+)', content, re.MULTILINE)
+            # 匹配 key=value 格式 (新) 或 key value 格式 (旧)
+            m = re.search(rf'^{key}[=\s]+(\d+)', content, re.MULTILINE)
             if m:
                 stats[key] = int(m.group(1))
 
@@ -899,7 +903,7 @@ class ZswapAnalyzer:
                     # 取每个线程数最终采样点的压缩比
                     if r.samples:
                         last = r.samples[-1]
-                        if last.compression_ratio is not None and last.zswap_compressed_pages > 0:
+                        if last.compression_ratio is not None and last.zswap_pool_total_size > 0:
                             threads_list.append(r.threads)
                             ratio_vals.append(last.compression_ratio)
                 if threads_list:
