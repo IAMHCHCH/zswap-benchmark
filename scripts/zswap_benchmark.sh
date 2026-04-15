@@ -306,7 +306,9 @@ collect_zswap_stats() {
         done
         echo ""
         echo "=== Zswap Debug Info ==="
-        cat /sys/kernel/debug/zswap/* 2>/dev/null || echo "Cannot read debug info"
+        for f in /sys/kernel/debug/zswap/*; do
+            [ -f "$f" ] && echo "$(basename $f)=$(cat $f 2>/dev/null)"
+        done
         echo ""
         echo "=== Memory Info ==="
         grep -E "MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree|Zswap" /proc/meminfo
@@ -471,15 +473,15 @@ def main():
 
         # zswap metrics
         stored_pages = '0'
-        compressed_pages = '0'
+        pool_total_size = '0'
         try:
             with open('/sys/kernel/debug/zswap/stored_pages') as f:
                 stored_pages = f.read().strip()
         except Exception:
             pass
         try:
-            with open('/sys/kernel/debug/zswap/compressed_pages') as f:
-                compressed_pages = f.read().strip()
+            with open('/sys/kernel/debug/zswap/pool_total_size') as f:
+                pool_total_size = f.read().strip()
         except Exception:
             pass
 
@@ -489,7 +491,7 @@ def main():
         # Write CSV row
         with open(phasefile, 'a') as f:
             f.write(f'{ts:.2f},{mem_current},{swap_current},'
-                    f'{stored_pages},{compressed_pages},'
+                    f'{stored_pages},{pool_total_size},'
                     f'{cpu_user},{cpu_sys},{cpu_idle},{cpu_total}\n')
 
         mem_mb = int(mem_current) // (1024 * 1024) if mem_current.isdigit() else 0
@@ -659,7 +661,7 @@ run_memtest() {
     } > "$outfile"
 
     # 写入采样 CSV 头
-    echo "timestamp,memory_current,swap_current,zswap_stored_pages,zswap_compressed_pages,cpu_user,cpu_system,cpu_idle,cpu_total" > "$phasefile"
+    echo "timestamp,memory_current,swap_current,zswap_stored_pages,zswap_pool_total_size,cpu_user,cpu_system,cpu_idle,cpu_total" > "$phasefile"
 
     # 采集 zswap 测试前快照
     collect_zswap_stats "$algo" "$threads" "pre"
@@ -1029,7 +1031,7 @@ generate_summary() {
                     local peak_mem=$(echo "$last_line" | cut -d, -f2)
                     local peak_swap=$(echo "$last_line" | cut -d, -f3)
                     local peak_stored=$(echo "$last_line" | cut -d, -f4)
-                    local peak_compressed=$(echo "$last_line" | cut -d, -f5)
+                    local peak_pool_size=$(echo "$last_line" | cut -d, -f5)
 
                     local peak_mem_mb=0
                     local peak_swap_mb=0
@@ -1042,9 +1044,11 @@ generate_summary() {
                     echo "    Peak memory.current: ${peak_mem_mb}MB" >> "$summary_file"
                     echo "    Peak swap.current:   ${peak_swap_mb}MB" >> "$summary_file"
 
-                    # 压缩比
-                    if [ -n "$peak_compressed" ] && [ "$peak_compressed" -gt 0 ] 2>/dev/null; then
-                        local ratio=$(echo "scale=2; $peak_stored / $peak_compressed" | bc 2>/dev/null)
+                    # 压缩比 = stored_pages * 4096 / pool_total_size
+                    if [ -n "$peak_stored" ] && [ "$peak_stored" -gt 0 ] 2>/dev/null \
+                       && [ -n "$peak_pool_size" ] && [ "$peak_pool_size" -gt 0 ] 2>/dev/null; then
+                        local orig_bytes=$((peak_stored * 4096))
+                        local ratio=$(echo "scale=2; $orig_bytes / $peak_pool_size" | bc 2>/dev/null)
                         echo "    Compression Ratio:   ${ratio}x" >> "$summary_file"
                     fi
                 fi
