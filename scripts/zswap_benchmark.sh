@@ -841,18 +841,20 @@ run_llama_bench() {
     log_info "  Phase 1: 预加载 $num_instances 份模型文件到内存..."
     local preloader_pids=()
     for i in $(seq 1 "$num_instances"); do
+        # 使用 read() 读入私有内存 (避免 mmap MAP_SHARED 共享 page cache)
+        # 每个进程持有 file_content 字节数组不释放, 占据独立 RAM
         python3 -c "
-import mmap, os, sys
-fd = os.open('$MODEL', os.O_RDONLY)
-buf = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
-# 强制 page-in: 顺序读取每 4KB 的第一个字节
-page_size = 4096
-total = len(buf)
-for off in range(0, total, page_size):
-    buf[off]
-os.close(fd)
-# 持有 mmap 不释放, 等待 stdin 关闭
-import sys
+import os, sys
+file_path = '$MODEL'
+file_size = os.path.getsize(file_path)
+buf = bytearray(file_size)
+with open(file_path, 'rb') as f:
+    total = 0
+    while total < file_size:
+        n = f.readinto(buf[total:])
+        if not n:
+            break
+        total += n
 sys.stdin.read()
 " &
         preloader_pids+=($!)
@@ -899,6 +901,7 @@ sys.stdin.read()
             -n "$GEN_LEN" \
             -t "$threads_per_instance" \
             -r "$ITERATIONS" \
+            -mmp 0 \
             > "$inst_out" 2>&1 &
         pids+=($!)
     done
