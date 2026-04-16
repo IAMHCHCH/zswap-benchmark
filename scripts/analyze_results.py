@@ -354,23 +354,24 @@ class ZswapAnalyzer:
             result.llama_sys_ms = int(m.group(1))
 
         # 提取各实例的 eval tokens/s
-        # llama-bench 输出格式: | model | size | params | backend | ngl | test | t/s |
-        # 匹配每实例输出中最后一行数据行的 t/s 值
+        # llama-bench markdown 输出格式: | model | ... | t/s |
+        # 最后一列格式: "123.45 ± 6.78"
+        # 用 ± 模式匹配来精确提取，避免误匹配参数数字
         eval_rates = []
         inst_blocks = re.split(r'---\s*Instance\s*\d+\s*---', content)
         for block in inst_blocks[1:]:  # skip text before first instance
-            # llama-bench 输出的最后一行通常包含 eval rate
-            # 匹配格式如: "qwen2 ...  123.45 ± 2.34" 或简单的数字行
             lines = block.strip().splitlines()
             for line in reversed(lines):
-                # llama-bench table output: last numeric column
-                nums = re.findall(r'(\d+\.\d+)', line)
-                if nums:
-                    try:
-                        eval_rates.append(float(nums[-1]))
-                        break
-                    except ValueError:
-                        pass
+                # 匹配 "123.45 ± 6.78" 模式 (t/s 标准差格式)
+                m = re.search(r'(\d+\.\d+)\s*±', line)
+                if m:
+                    eval_rates.append(float(m.group(1)))
+                    break
+                # fallback: 匹配 "123.45" 后紧跟 t/s 关键字
+                m = re.search(r'(\d+\.\d+)\s*t/s', line)
+                if m:
+                    eval_rates.append(float(m.group(1)))
+                    break
 
         if eval_rates:
             result.llama_eval_rates = eval_rates
