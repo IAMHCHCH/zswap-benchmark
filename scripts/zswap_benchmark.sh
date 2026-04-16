@@ -901,6 +901,7 @@ sys.stdin.read()
             -n "$GEN_LEN" \
             -t "$threads_per_instance" \
             -r "$ITERATIONS" \
+            -ngl 0 \
             -mmp 0 \
             > "$inst_out" 2>&1 &
         pids+=($!)
@@ -981,8 +982,9 @@ sys.stdin.read()
                 echo "--- Instance $i (PID ${pids[$((i-1))]}) ---"
                 cat "$f"
                 echo ""
-                # 统计成功实例数 (llama-bench 正常退出会产生包含数字的输出)
-                if grep -qE '^[0-9]+' "$f" 2>/dev/null; then
+                # llama-bench markdown 格式数据行以 "|" 开头，包含 t/s 数值
+                # 也匹配 "t/s" 或数字+± 模式表示成功输出
+                if grep -qE '^\|.+\|.+±' "$f" 2>/dev/null; then
                     success_count=$((success_count + 1))
                 fi
             else
