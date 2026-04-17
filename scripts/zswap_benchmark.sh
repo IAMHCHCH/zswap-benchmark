@@ -16,15 +16,17 @@ CGROUP_MEM_HIGH="16G"                # cgroup memory.high (软节流阈值, 不�
 SWAPFILE_SIZE="16G"                  # swap 文件大小
 SWAPFILE="/swapfile"                 # swap 文件路径
 SWAP_PRIORITY=100                    # swap 优先级
-THREADS="8 16 32 64 72 80 96 112 128 144 160"  # 三阶段均衡: 无swap(3) + zswap(5) + swap满(3), 64线程起进入二阶段
+# 线程梯度: 每阶段取 2 个代表值, 6 组总耗时约 15 分钟 (vs 原 11 组约 30 分钟)
+THREADS="8 32 64 80 128 160"         # 三阶段均衡: 无swap(8,32) + zswap(64,80) + swap满(128,160)
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 硬件deflate(hisi-deflate-acomp)
 TEST_DURATION=30                     # 每组测试持续时间 (秒)
 SAMPLE_INTERVAL=1                    # 采样间隔 (秒)
+LLAMA_ENABLED=0                      # 是否启用 llama-bench 测试 (0=跳过, 1=启用)
 MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"   # 测试模型路径 (需下载 GGUF 模型, 留空则跳过)
 DATA_SOURCE=""                                 # 内存填充数据源 (留空=固定模式0xAA, 指定文件路径如 silesia.tar 则循环填充真实数据)
-PROMPT_LEN=512                       # prompt 长度
-GEN_LEN=128                          # 生成长度
-ITERATIONS=3                         # 每组测试次数
+PROMPT_LEN=512                       # llama-bench prompt 长度
+GEN_LEN=64                           # llama-bench 生成长度 (降低加快推理)
+ITERATIONS=1                         # llama-bench 每组测试次数
 
 # 结果目录
 RESULT_DIR="$(dirname "$0")/../results/results_$(date +%Y%m%d_%H%M%S)"
@@ -743,7 +745,13 @@ run_llama_bench() {
     local outfile="$RESULT_DIR/bench_${algo}_t${threads}.log"
     local phasefile="$RESULT_DIR/phase_llama_${algo}_t${threads}.log"
 
+    # LLAMA_ENABLED=0 时直接跳过，不打印任何信息
+    if [ $LLAMA_ENABLED -eq 0 ]; then
+        return
+    fi
+
     if [ $LLAMA_BENCH_AVAILABLE -eq 0 ]; then
+        log_info "  llama-bench 未安装，跳过"
         return
     fi
 
@@ -753,8 +761,8 @@ run_llama_bench() {
     fi
 
     # ---- 计算并发实例数 ----
-    # 目标: N 个实例 × model_size ≈ threads × PER_THREAD_MEM
-    # 使 llama-bench 独立构造与 memtest 相同量级的内存压力
+    # 原则: 总内存占用 (N × model_size + KV cache + overhead) <= cgroup_high + swap
+    # 不能简单用 target_mem / model_size，因为没算 KV cache 等运行时开销
     local model_size_bytes
     model_size_bytes=$(stat -c %s "$MODEL" 2>/dev/null || echo "0")
     local model_size_mb=$((model_size_bytes / 1024 / 1024))
@@ -764,14 +772,45 @@ run_llama_bench() {
         model_size_mb=1024  # 保守估计 1GB
     fi
 
+    # KV cache + 运行时开销估算 (prompt+gen 分配的中间 buffer)
+    # 大致估算: batch*n_ctx*layers*hidden*bytes_per_element / threads
+    # 粗略按模型大小的 40% 估算，留有余量
+    local kv_overhead_mb=$((model_size_mb * 40 / 100))
+    [ "$kv_overhead_mb" -lt 512 ] && kv_overhead_mb=512  # 至少留 512MB
+
+    local per_instance_mem_mb=$((model_size_mb + kv_overhead_mb))
+
+    local cgroup_high_mb
+    cgroup_high_mb=$(($(mem_to_bytes "$CGROUP_MEM_HIGH") / 1024 / 1024))
+    local swap_size_mb
+    swap_size_mb=$(($(mem_to_bytes "$SWAPFILE_SIZE") / 1024 / 1024))
+    local total_capacity_mb=$((cgroup_high_mb + swap_size_mb))
+
+    # 安全上限: 总容量留 2GB 余量给系统，避免恰好满触发 OOM
+    local safe_capacity_mb=$((total_capacity_mb - 2048))
+
+    # 满足目标压力所需的最小实例数 (原逻辑)
     local per_thread_bytes
     per_thread_bytes=$(mem_to_bytes "$PER_THREAD_MEM")
     local total_target_mb=$((per_thread_bytes * threads / 1024 / 1024))
-
-    # num_instances = ceil(total_target / model_size), 至少 1
-    local num_instances=1
+    local num_instances_by_target=1
     if [ "$model_size_mb" -gt 0 ]; then
-        num_instances=$(( (total_target_mb + model_size_mb - 1) / model_size_mb ))
+        num_instances_by_target=$(( (total_target_mb + model_size_mb - 1) / model_size_mb ))
+    fi
+
+    # 安全上限: 不能超过 cgroup 容量能容纳的实例数
+    local num_instances_by_capacity=1
+    if [ "$per_instance_mem_mb" -gt 0 ]; then
+        num_instances_by_capacity=$(( safe_capacity_mb / per_instance_mem_mb ))
+    fi
+    [ "$num_instances_by_capacity" -lt 1 ] && num_instances_by_capacity=1
+
+    # 取两者较小值，确保不超过 cgroup 容量
+    local num_instances=$num_instances_by_target
+    if [ "$num_instances_by_capacity" -lt "$num_instances" ]; then
+        log_warn "  目标需要 $num_instances 实例(${total_target_mb}MB)，"
+        log_warn "  但 cgroup 容量 ${safe_capacity_mb}MB 最多支持 $num_instances_by_capacity 实例"
+        num_instances=$num_instances_by_capacity
     fi
     [ "$num_instances" -lt 1 ] && num_instances=1
     [ "$num_instances" -gt 32 ] && num_instances=32
@@ -781,24 +820,21 @@ run_llama_bench() {
     [ "$threads_per_instance" -lt 1 ] && threads_per_instance=1
 
     local total_model_mem_mb=$((num_instances * model_size_mb))
-    local cgroup_high_mb
-    cgroup_high_mb=$(($(mem_to_bytes "$CGROUP_MEM_HIGH") / 1024 / 1024))
-    local swap_size_mb
-    swap_size_mb=$(($(mem_to_bytes "$SWAPFILE_SIZE") / 1024 / 1024))
+    local total_with_overhead_mb=$((num_instances * per_instance_mem_mb))
 
-    # 判断预期阶段
+    # 判断预期阶段 (基于实际开销估算)
     local expected_phase="无 swap"
-    local total_capacity=$((cgroup_high_mb + swap_size_mb))
-    if [ "$total_model_mem_mb" -ge "$cgroup_high_mb" ]; then
+    if [ "$total_with_overhead_mb" -ge "$cgroup_high_mb" ]; then
         expected_phase="zswap 压缩"
     fi
-    if [ "$total_model_mem_mb" -ge "$total_capacity" ]; then
+    if [ "$total_with_overhead_mb" -ge "$total_capacity_mb" ]; then
         expected_phase="swap 满载"
     fi
 
     log_info "运行 llama-bench (多进程): algo=$algo, threads=$threads"
     log_info "  并发实例: $num_instances, 每实例线程: $threads_per_instance"
-    log_info "  模型大小: ${model_size_mb}MB, 总模型内存: ${total_model_mem_mb}MB"
+    log_info "  模型大小: ${model_size_mb}MB, KV+overhead: ${kv_overhead_mb}MB/实例"
+    log_info "  估算总内存: ${total_with_overhead_mb}MB (容量: ${safe_capacity_mb}MB)"
     log_info "  预期阶段: $expected_phase"
 
     # ---- 确保当前 shell 在 cgroup 中 ----
@@ -813,7 +849,9 @@ run_llama_bench() {
         echo "Threads_Per_Instance: $threads_per_instance"
         echo "Model: $MODEL"
         echo "Model_Size_MB: $model_size_mb"
-        echo "Total_Model_Mem_MB: $total_model_mem_mb"
+        echo "KV_Overhead_MB: $kv_overhead_mb"
+        echo "Total_Mem_Estimate_MB: $total_with_overhead_mb"
+        echo "Safe_Capacity_MB: $safe_capacity_mb"
         echo "Cgroup_High_MB: $cgroup_high_mb"
         echo "Swap_Size_MB: $swap_size_mb"
         echo "Expected_Phase: $expected_phase"
@@ -970,7 +1008,7 @@ sys.stdin.read()
         echo ""
         echo "=== Aggregated Results ==="
         echo "Concurrent_Instances: $num_instances"
-        echo "Total_Model_Mem_MB: $total_model_mem_mb"
+        echo "Total_Mem_Estimate_MB: $total_with_overhead_mb"
         echo "llama_user_ms: $llama_user_ms"
         echo "llama_sys_ms: $llama_sys_ms"
         echo ""
@@ -1157,7 +1195,7 @@ generate_summary() {
             local bench_file="$RESULT_DIR/bench_${algo}_t${t}.log"
             if [ -f "$bench_file" ]; then
                 local bench_instances=$(grep "^Concurrent_Instances:" "$bench_file" 2>/dev/null | awk '{print $2}')
-                local bench_total_mem=$(grep "^Total_Model_Mem_MB:" "$bench_file" 2>/dev/null | awk '{print $2}')
+                local bench_total_mem=$(grep "^Total_Mem_Estimate_MB:" "$bench_file" 2>/dev/null | awk '{print $2}')
                 local bench_success=$(grep "^Successful_Instances:" "$bench_file" 2>/dev/null | awk '{print $2}')
                 local bench_user=$(grep "^llama_user_ms:" "$bench_file" 2>/dev/null | awk '{print $2}')
                 local bench_sys=$(grep "^llama_sys_ms:" "$bench_file" 2>/dev/null | awk '{print $2}')
