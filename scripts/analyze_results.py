@@ -338,7 +338,7 @@ class ZswapAnalyzer:
         m = re.search(r'Concurrent_Instances:\s+(\d+)', content)
         if m:
             result.llama_instances = int(m.group(1))
-        m = re.search(r'Total_Model_Mem_MB:\s+(\d+)', content)
+        m = re.search(r'Total_Mem_Estimate_MB:\s+(\d+)', content)
         if m:
             result.llama_total_model_mem_mb = int(m.group(1))
         m = re.search(r'Successful_Instances:\s+(\d+)\s*/\s*\d+', content)
