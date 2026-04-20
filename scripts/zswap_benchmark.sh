@@ -21,7 +21,7 @@ THREADS="8 32 64 80 128 160"         # 三阶段均衡: 无swap(8,32) + zswap(64
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 硬件deflate(hisi-deflate-acomp)
 TEST_DURATION=30                     # 每组测试持续时间 (秒)
 SAMPLE_INTERVAL=1                    # 采样间隔 (秒)
-LLAMA_ENABLED=0                      # 是否启用 llama-bench 测试 (0=跳过, 1=启用)
+LLAMA_ENABLED=1                      # 是否启用 llama-bench 测试 (0=跳过, 1=启用)
 MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"   # 测试模型路径 (需下载 GGUF 模型, 留空则跳过)
 DATA_SOURCE=""                                 # 内存填充数据源 (留空=固定模式0xAA, 指定文件路径如 silesia.tar 则循环填充真实数据)
 PROMPT_LEN=512                       # llama-bench prompt 长度
