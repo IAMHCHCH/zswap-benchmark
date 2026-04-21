@@ -558,6 +558,145 @@ sys.stdin.read()
     log_info "  llama-bench 完成: user=${llama_user_ms}ms, sys=${llama_sys_ms}ms, 成功=${success_count:-?}/${num_instances}"
 }
 
+# ========== 预评估：测量单个实例内存使用 ==========
+# 在测试开始前运行，确保能覆盖三阶段
+pre_evaluate_instance() {
+    log_info "========== 预评估: 测量单个 llama 实例内存使用 =========="
+
+    if [ $LLAMA_BENCH_AVAILABLE -eq 0 ]; then
+        log_warn "llama-bench 未安装，跳过预评估"
+        return
+    fi
+
+    if [ ! -f "$MODEL" ]; then
+        log_warn "模型文件不存在，跳过预评估"
+        return
+    fi
+
+    # 获取模型大小
+    local model_size_bytes
+    model_size_bytes=$(stat -c %s "$MODEL" 2>/dev/null || echo "0")
+    local model_size_mb=$((model_size_bytes / 1024 / 1024))
+
+    if [ "$model_size_bytes" -eq 0 ]; then
+        model_size_mb=1024
+    fi
+
+    local cgroup_high_mb
+    cgroup_high_mb=$(($(mem_to_bytes "$CGROUP_MEM_HIGH") / 1024 / 1024))
+    local swap_size_mb
+    swap_size_mb=$(($(mem_to_bytes "$SWAPFILE_SIZE") / 1024 / 1024))
+    local total_capacity_mb=$((cgroup_high_mb + swap_size_mb))
+
+    log_info "模型大小: ${model_size_mb}MB"
+    log_info "cgroup high: ${cgroup_high_mb}MB"
+    log_info "swap size: ${swap_size_mb}MB"
+    log_info "总容量: ${total_capacity_mb}MB"
+
+    # 启动单个实例，测量实际内存使用
+    log_info "启动单个 llama-bench 实例进行内存测量..."
+
+    local preloader_pid
+    local pre_mem_before=0
+    local pre_mem_after=0
+
+    # 先预加载模型到内存
+    python3 -c "
+import os, sys
+file_path = '$MODEL'
+file_size = os.path.getsize(file_path)
+buf = bytearray(file_size)
+with open(file_path, 'rb') as f:
+    total = 0
+    while total < file_size:
+        n = f.readinto(buf[total:])
+        if not n:
+            break
+        total += n
+sys.stdin.read()
+" &
+    preloader_pid=$!
+    sleep 3
+
+    pre_mem_before=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null || echo "0")
+
+    # 启动 llama-bench 进程
+    local bench_pid
+    llama-bench -m "$MODEL" -p "$PROMPT_LEN" -n "$GEN_LEN" -t 1 -r 1 -ngl 0 -mmp 0 > /dev/null 2>&1 &
+    bench_pid=$!
+
+    sleep 5
+
+    pre_mem_after=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null || echo "0")
+
+    # 清理
+    kill "$bench_pid" 2>/dev/null || true
+    wait "$bench_pid" 2>/dev/null || true
+    kill "$preloader_pid" 2>/dev/null || true
+    wait "$preloader_pid" 2>/dev/null || true
+
+    local mem_delta=$((pre_mem_after - pre_mem_before))
+    local instance_mem_mb=$((mem_delta / 1024 / 1024))
+
+    # 如果测量值不合理，使用估算值
+    if [ "$instance_mem_mb" -lt 512 ] || [ "$instance_mem_mb" -gt 20480 ]; then
+        instance_mem_mb=$((model_size_mb * 140 / 100))
+        log_warn "内存测量值异常，使用估算值: ${instance_mem_mb}MB"
+    else
+        log_info "实测单实例内存: ${instance_mem_mb}MB"
+    fi
+
+    # 计算能覆盖三阶段的实例数范围
+    local max_instances=$((total_capacity_mb / instance_mem_mb))
+    [ "$max_instances" -lt 1 ] && max_instances=1
+    [ "$max_instances" -gt 32 ] && max_instances=32
+
+    # 确保至少 3 个实例才能展示三阶段
+    local phase1_instances=1
+    local phase2_instances=$(( (cgroup_high_mb * 80 / 100) / instance_mem_mb + 1))
+    local phase3_instances=$(( (total_capacity_mb * 80 / 100) / instance_mem_mb + 1))
+
+    # 确保三个阶段的实例数不同且递增
+    [ "$phase2_instances" -le "$phase1_instances" ] && phase2_instances=$((phase1_instances + 1))
+    [ "$phase3_instances" -le "$phase2_instances" ] && phase3_instances=$((phase2_instances + 1))
+    [ "$phase3_instances" -gt "$max_instances" ] && phase3_instances=$max_instances
+
+    log_info "三阶段实例数建议:"
+    log_info "  阶段1 (无swap):   $phase1_instances 实例 (~${phase1_instances} × ${instance_mem_mb}MB = $((phase1_instances * instance_mem_mb))MB)"
+    log_info "  阶段2 (zswap):   $phase2_instances 实例 (~${phase2_instances} × ${instance_mem_mb}MB = $((phase2_instances * instance_mem_mb))MB)"
+    log_info "  阶段3 (swap满):  $phase3_instances 实例 (~${phase3_instances} × ${instance_mem_mb}MB = $((phase3_instances * instance_mem_mb))MB)"
+    log_info "  最大实例数:       $max_instances"
+
+    # 生成新的 THREADS 列表，覆盖三阶段
+    local new_threads=""
+    local thread_per_instance=8  # 每实例分配 8 线程
+
+    for n in $phase1_instances $phase2_instances $phase3_instances; do
+        local t=$((n * thread_per_instance))
+        new_threads="$new_threads $t"
+    done
+
+    # 去重并排序
+    THREADS=$(echo "$new_threads" | tr ' ' '\n' | sort -nu | tr '\n' ' ')
+    THREADS="${THREADS% }"
+
+    log_info "调整后的测试线程列表: $THREADS"
+
+    # 写入评估结果
+    {
+        echo "Model_Size_MB: $model_size_mb"
+        echo "Instance_Mem_MB: $instance_mem_mb"
+        echo "Cgroup_High_MB: $cgroup_high_mb"
+        echo "Swap_Size_MB: $swap_size_mb"
+        echo "Total_Capacity_MB: $total_capacity_mb"
+        echo "Phase1_Instances: $phase1_instances"
+        echo "Phase2_Instances: $phase2_instances"
+        echo "Phase3_Instances: $phase3_instances"
+        echo "Max_Instances: $max_instances"
+        echo "Adjusted_Threads: $THREADS"
+    } > "$RESULT_DIR/pre_evaluation.txt"
+}
+
 # ========== 主测试循环 ==========
 run_tests() {
     log_info "开始测试循环..."
@@ -759,6 +898,9 @@ main() {
 
     # 注册清理函数
     trap cleanup EXIT
+
+    # 预评估：测量单实例内存，调整线程列表
+    pre_evaluate_instance
 
     # 运行测试
     run_tests
