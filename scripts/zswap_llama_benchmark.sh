@@ -709,7 +709,54 @@ run_tests() {
         # 采集测试前 zswap 快照
         collect_zswap_stats "$algo" "0" "pre"
 
+        local prev_instances=0
+        local hit_cap=0
+
         for t in $THREADS; do
+            # 计算本轮实例数预判（与 run_llama_bench 内部逻辑一致）
+            local model_size_bytes
+            model_size_bytes=$(stat -c %s "$MODEL" 2>/dev/null || echo "0")
+            local model_size_mb=$((model_size_bytes / 1024 / 1024))
+            [ "$model_size_bytes" -eq 0 ] && model_size_mb=1024
+
+            local kv_overhead_mb=$((model_size_mb * 40 / 100))
+            [ "$kv_overhead_mb" -lt 512 ] && kv_overhead_mb=512
+            local per_instance_mem_mb=$((model_size_mb + kv_overhead_mb))
+
+            local cgroup_high_mb=$(($(mem_to_bytes "$CGROUP_MEM_HIGH") / 1024 / 1024))
+            local swap_size_mb=$(($(mem_to_bytes "$SWAPFILE_SIZE") / 1024 / 1024))
+            local total_capacity_mb=$((cgroup_high_mb + swap_size_mb))
+            local safe_capacity_mb=$((total_capacity_mb - 2048))
+
+            local per_thread_bytes=$(mem_to_bytes "$PER_THREAD_MEM")
+            local total_target_mb=$((per_thread_bytes * t / 1024 / 1024))
+            local num_instances_by_target=1
+            if [ "$model_size_mb" -gt 0 ]; then
+                num_instances_by_target=$(( (total_target_mb + model_size_mb - 1) / model_size_mb ))
+            fi
+            local num_instances_by_capacity=1
+            if [ "$per_instance_mem_mb" -gt 0 ]; then
+                num_instances_by_capacity=$(( safe_capacity_mb / per_instance_mem_mb ))
+            fi
+            [ "$num_instances_by_capacity" -lt 1 ] && num_instances_by_capacity=1
+            local cur_instances=$num_instances_by_target
+            [ "$num_instances_by_capacity" -lt "$cur_instances" ] && cur_instances=$num_instances_by_capacity
+            [ "$cur_instances" -lt 1 ] && cur_instances=1
+            [ "$cur_instances" -gt 32 ] && cur_instances=32
+
+            # 实例数已达到上限，跳过
+            if [ "$cur_instances" -eq "$prev_instances" ] && [ "$hit_cap" -eq 1 ]; then
+                log_info "---------- 线程数: $t ----------"
+                log_info "实例数已达上限 ($cur_instances)，跳过"
+                continue
+            fi
+
+            if [ "$cur_instances" -ge 32 ]; then
+                hit_cap=1
+            fi
+
+            prev_instances=$cur_instances
+
             log_info "---------- 线程数: $t ----------"
             run_llama_bench "$algo" "$t"
 
