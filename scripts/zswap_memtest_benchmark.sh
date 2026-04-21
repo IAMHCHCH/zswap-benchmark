@@ -1,16 +1,12 @@
 #!/bin/bash
 #
-# zswap_benchmark.sh - Zswap 性能测试主脚本
-# 对比 lz4/deflate-sw/lzo/zstd/deflate 在不同线程数下的性能表现
+# zswap_memtest_benchmark.sh - Zswap 内存压力测试专用脚本
+# 仅运行 memset/mmap 内存压力测试，对比不同压缩算法性能
 # 适配 openEuler 24.03 (LTS-SP2) aarch64 + 鲲鹏920 环境
 #
-# 测试模型: 每线程固定分配 256MB，随线程增长自然打满 cgroup → 触发 zswap → 打满 swap → OOM
-# 三个阶段: 无 swap → zswap 压缩 → swap 满载
-#
 # 使用方式:
-#   ./zswap_benchmark.sh              # 运行所有测试 (memtest + llama-bench)
-#   ./zswap_benchmark.sh --mode=memtest  # 仅运行 memtest 测试
-#   ./zswap_benchmark.sh --mode=llama    # 仅运行 llama-bench 测试
+#   ./zswap_memtest_benchmark.sh              # 使用默认配置运行
+#   ./zswap_memtest_benchmark.sh --threads=8,32,64  # 自定义线程数
 #
 
 set -e
@@ -25,79 +21,11 @@ SWAP_PRIORITY=100                    # swap 优先级
 THREADS="8 32 64 80 128 160"         # 三阶段均衡: 无swap(8,32) + zswap(64,80) + swap满(128,160)
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 硬件deflate(hisi-deflate-acomp)
 TEST_DURATION=30                     # 每组测试持续时间 (秒)
-SAMPLE_INTERVAL=1                    # 采样间隔 (秒)
-LLAMA_ENABLED=1                      # 是否启用 llama-bench 测试 (0=跳过, 1=启用)
-MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"   # 测试模型路径 (需下载 GGUF 模型, 留空则跳过)
-DATA_SOURCE=""                                 # 内存填充数据源 (留空=固定模式0xAA, 指定文件路径如 silesia.tar 则循环填充真实数据)
-PROMPT_LEN=512                       # llama-bench prompt 长度
-GEN_LEN=64                           # llama-bench 生成长度 (降低加快推理)
-ITERATIONS=1                         # llama-bench 每组测试次数
+DATA_SOURCE=""                       # 内存填充数据源 (留空=固定模式0xAA, 指定文件路径则循环填充真实数据)
 
-# 测试模式: memtest | llama | all (默认 all)
-TEST_MODE="all"
-
-# 结果目录
-RESULT_DIR="$(dirname "$0")/../results/results_$(date +%Y%m%d_%H%M%S)"
+# 结果目录 (添加 memtest 标识)
+RESULT_DIR="$(dirname "$0")/../results/memtest_$(date +%Y%m%d_%H%M%S)"
 # ========== 配置结束 ==========
-
-# ========== 命令行参数解析 ==========
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --mode=*)
-                TEST_MODE="${1#*=}"
-                shift
-                ;;
-            --mode)
-                TEST_MODE="$2"
-                shift 2
-                ;;
-            --help|-h)
-                show_help
-                exit 0
-                ;;
-            *)
-                echo "Unknown option: $1"
-                echo "Use --help for usage information"
-                exit 1
-                ;;
-        esac
-    done
-
-    # 验证模式
-    case "$TEST_MODE" in
-        memtest|llama|all) ;;
-        *)
-            echo "Invalid --mode: $TEST_MODE"
-            echo "Valid modes: memtest, llama, all"
-            exit 1
-            ;;
-    esac
-}
-
-show_help() {
-    cat << EOF
-Usage: $0 [OPTIONS]
-
-Zswap Performance Benchmark - 测试 zswap 压缩算法在不同内存压力下的性能
-
-Options:
-    --mode=MODE    测试模式: memtest | llama | all (默认: all)
-    --help, -h     显示此帮助信息
-
-测试模式说明:
-    memtest        仅运行内存压力测试 (memset/mmap)
-    llama          仅运行 llama-bench 推理测试
-    all            运行所有测试 (默认)
-
-示例:
-    $0                      # 运行所有测试
-    $0 --mode=memtest      # 仅运行内存压力测试
-    $0 --mode=llama        # 仅运行 llama-bench 测试
-
-结果将保存在 results/ 目录中，使用 analyze_results.py 进行分析。
-EOF
-}
 
 # 颜色输出
 RED='\033[0;31m'
@@ -136,20 +64,6 @@ check_dependencies() {
             exit 1
         fi
     done
-
-    # 检查 llama-bench (可选)
-    if [ -n "$MODEL" ] && [ -f "$MODEL" ]; then
-        if command -v llama-bench &> /dev/null; then
-            LLAMA_BENCH_AVAILABLE=1
-            log_info "llama-bench 可用, 模型: $MODEL"
-        else
-            log_warn "llama-bench 未安装, 将使用内存压力测试"
-            LLAMA_BENCH_AVAILABLE=0
-        fi
-    else
-        log_info "未配置模型文件, 使用内存压力测试"
-        LLAMA_BENCH_AVAILABLE=0
-    fi
 }
 
 # ========== 硬件加速器检测 ==========
@@ -170,7 +84,6 @@ detect_hw_accelerator() {
         log_hw "HiSilicon ZIP 已加载 (uacc_mode=1, pf_q_num=256)"
 
         # 发现 ZIP 设备的 NUMA 拓扑
-        local dev_idx=0
         for uacce in /sys/class/uacce/hisi_zip-*; do
             if [ -d "$uacce" ]; then
                 local dev_name=$(basename "$uacce")
@@ -180,14 +93,10 @@ detect_hw_accelerator() {
                 fi
                 if [ -n "$node_id" ]; then
                     log_hw "  $dev_name -> NUMA node $node_id"
-                    # 取第一个设备的 NUMA node
-                    if [ -z "$ZIP_NUMA_NODE" ]; then
-                        ZIP_NUMA_NODE="$node_id"
-                    fi
+                    [ -z "$ZIP_NUMA_NODE" ] && ZIP_NUMA_NODE="$node_id"
                 else
                     log_hw "  $dev_name -> NUMA node (未知)"
                 fi
-                dev_idx=$((dev_idx + 1))
             fi
         done
 
@@ -253,7 +162,7 @@ setup_cgroup() {
         exit 1
     fi
 
-    CGROUP_DIR="/sys/fs/cgroup/zswap_bench"
+    CGROUP_DIR="/sys/fs/cgroup/zswap_memtest_bench"
 
     # 清理可能残留的旧 cgroup
     if [ -d "$CGROUP_DIR" ]; then
@@ -272,18 +181,15 @@ setup_cgroup() {
     echo $$ > "$CGROUP_DIR/cgroup.procs"
 
     # 设置内存限制
-    # memory.max 保持 "max" 不设硬限制, 避免 OOM killer 杀进程
-    # 当 swap 空间耗尽后, 新的内存分配会在 page fault 处阻塞 (throttle),
-    # 直到已有页面被回收释放, 但进程不会被 kill
     echo "max" > "$CGROUP_DIR/memory.max"
     echo "$CGROUP_MEM_HIGH" > "$CGROUP_DIR/memory.high"
 
-    # 限制 swap 用量 (等于 swapfile 大小, 可观察满载)
-    echo "$SWAPFILE_SIZE" > "$CGROUP_DIR/memory.swap.max"
+    # 限制 swap 用量
+    echo "$SWAPFILE_SIZE" > "$CGGROUP_DIR/memory.swap.max"
 
     log_info "cgroup v2 创建完成:"
-    log_info "  memory.max   = $(cat $CGROUP_DIR/memory.max) (不设硬限制, 避免 OOM)"
-    log_info "  memory.high  = $(cat $CGROUP_DIR/memory.high)"
+    log_info "  memory.max   = $(cat $CGROUP_DIR/memory.max)"
+    log_info "  memory.high  = $(cat $CGGROUP_DIR/memory.high)"
     log_info "  memory.swap.max = $(cat $CGROUP_DIR/memory.swap.max)"
 }
 
@@ -292,7 +198,6 @@ configure_zswap() {
     local algo=$1
     local display_algo="$algo"
 
-    # deflate-sw 内部使用 deflate 算法但卸载硬件加速器
     if [ "$algo" = "deflate-sw" ]; then
         algo="deflate"
         log_info "配置 zswap: 算法=deflate (强制软件实现)"
@@ -300,10 +205,8 @@ configure_zswap() {
         log_info "配置 zswap: 算法=$algo"
     fi
 
-    # 检查 zswap 是否可用
     if [ ! -d /sys/module/zswap ]; then
         log_err "zswap 模块未加载!"
-        log_err "请确保使用支持 zswap 的内核 (CONFIG_ZSWAP=y)"
         exit 1
     fi
 
@@ -315,15 +218,12 @@ configure_zswap() {
         deflate) modprobe deflate 2>/dev/null || true ;;
     esac
 
-    # 控制硬件加速器: 仅在测试 "deflate"(非 sw) 时加载 hisi_zip
-    # 其他算法均卸载 hisi_zip 以确保使用纯软件实现
-    # rmmod 前需 swapoff, 否则 zswap 占用 hisi_zip 导致卸载失败
+    # 控制硬件加速器
     swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
     if [ "$display_algo" = "deflate" ]; then
         modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
     fi
-    # 重新启用 swapfile (swapoff 后必须 swapon)
     swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
     # 配置 zswap 参数
@@ -340,7 +240,6 @@ configure_zswap() {
     # 验证配置
     local current_algo=$(cat /sys/module/zswap/parameters/compressor)
     local current_enabled=$(cat /sys/module/zswap/parameters/enabled)
-    local current_shrinker=$(cat /sys/module/zswap/parameters/shrinker_enabled 2>/dev/null || echo "N/A")
 
     local hw_status="软件"
     case $display_algo in
@@ -348,11 +247,9 @@ configure_zswap() {
             grep -q "hisi-deflate-acomp" /proc/crypto 2>/dev/null && hw_status="硬件(hisi-deflate-acomp)"
             ;;
         deflate-sw) hw_status="软件(deflate)" ;;
-        lz4)        hw_status="软件(lz4)" ;;
-        lzo)        hw_status="软件(lzo)" ;;
-        zstd)       hw_status="软件(zstd)" ;;
+        lz4|lzo|zstd) hw_status="软件($algo)" ;;
     esac
-    log_info "zswap 配置: enabled=$current_enabled, compressor=$current_algo, shrinker=$current_shrinker, 实现=$hw_status"
+    log_info "zswap 配置: enabled=$current_enabled, compressor=$current_algo, 实现=$hw_status"
 
     sleep 1
 }
@@ -361,7 +258,7 @@ configure_zswap() {
 collect_zswap_stats() {
     local algo=$1
     local threads=$2
-    local tag=$3  # "pre" or "post"
+    local tag=$3
     local outfile="$RESULT_DIR/zswap_${algo}_t${threads}_${tag}.log"
 
     {
@@ -454,10 +351,7 @@ def main():
                 buf = mmap.mmap(-1, per_thread)
                 page_size = 4096
                 if fill_data and len(fill_data) > 0:
-                    # Fill with real data, repeating to cover the full allocation
                     data_len = len(fill_data)
-                    # Write in large chunks via slice assignment (much faster than byte-by-byte)
-                    # First, create a repeating pattern that covers at least per_thread bytes
                     if data_len >= per_thread:
                         buf[:] = fill_data[:per_thread]
                     else:
@@ -465,7 +359,6 @@ def main():
                         big_data = (fill_data * repeats)[:per_thread]
                         buf[:] = big_data
                 else:
-                    # Default: fixed pattern 0xAA
                     for offset in range(0, per_thread, page_size):
                         buf[offset] = 0xAA
                 t1 = time.time()
@@ -535,7 +428,6 @@ def main():
 
     cpu_before = read_proc_stat()
 
-    # Read cgroup cpu.stat baseline
     cgroup_cpu_user_before = 0
     cgroup_cpu_sys_before = 0
     try:
@@ -551,7 +443,6 @@ def main():
     for sec in range(duration):
         ts = time.time()
 
-        # cgroup metrics
         try:
             with open(os.path.join(cgroup_dir, 'memory.current')) as f:
                 mem_current = f.read().strip()
@@ -564,7 +455,6 @@ def main():
         except Exception:
             swap_current = '0'
 
-        # zswap metrics
         stored_pages = '0'
         pool_total_size = '0'
         try:
@@ -578,10 +468,8 @@ def main():
         except Exception:
             pass
 
-        # CPU metrics from /proc/stat
         cpu_total, cpu_user, cpu_sys, cpu_idle = read_proc_stat()
 
-        # Write CSV row
         with open(phasefile, 'a') as f:
             f.write(f'{ts:.2f},{mem_current},{swap_current},'
                     f'{stored_pages},{pool_total_size},'
@@ -601,7 +489,6 @@ def main():
     wall_end = time.time()
     wall_elapsed = wall_end - wall_start
 
-    # Read per-child CPU usage before killing (utime=stat[13], stime=stat[14])
     clk_tck = os.sysconf('SC_CLK_TCK') or 100
     child_user_ticks = 0
     child_sys_ticks = 0
@@ -616,7 +503,6 @@ def main():
     child_user_sec = child_user_ticks / clk_tck
     child_sys_sec = child_sys_ticks / clk_tck
 
-    # Read cgroup cpu.stat for per-cgroup user/sys breakdown
     cgroup_cpu_user_after = 0
     cgroup_cpu_sys_after = 0
     try:
@@ -641,7 +527,6 @@ def main():
         except Exception:
             pass
 
-    # Per-process CPU time (children cumulative)
     try:
         import resource
         ru = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -651,7 +536,6 @@ def main():
         proc_user_sec = 0.0
         proc_sys_sec = 0.0
 
-    # System-wide CPU breakdown during hold phase
     cpu_d_total = cpu_after[0] - cpu_before[0]
     cpu_d_user = cpu_after[1] - cpu_before[1]
     cpu_d_sys = cpu_after[2] - cpu_before[2]
@@ -666,7 +550,6 @@ def main():
         cpu_sys_pct = 0.0
         cpu_idle_pct = 0.0
 
-    # cgroup CPU delta: business (user) vs compression/kernel (sys)
     cg_d_user = cgroup_cpu_user_after - cgroup_cpu_user_before
     cg_d_sys = cgroup_cpu_sys_after - cgroup_cpu_sys_before
     cg_d_total = cg_d_user + cg_d_sys
@@ -698,8 +581,7 @@ PYEOF
     chmod +x "$RESULT_DIR/_memtest_runner.py"
 }
 
-# ========== 内存压力测试 (核心) ==========
-# 每线程分配 PER_THREAD_MEM 匿名内存, 逐秒采样 cgroup/zswap 指标
+# ========== 内存压力测试 ==========
 run_memtest() {
     local algo=$1
     local threads=$2
@@ -729,12 +611,10 @@ run_memtest() {
     # 确定 NUMA 绑定策略
     local numa_prefix=""
     if [ "$algo" = "deflate" ] && [ -n "$ZIP_NUMA_NODE" ]; then
-        # 硬件 deflate: 绑定到 ZIP 设备所在 NUMA node
         numa_prefix="numactl --cpunodebind=$ZIP_NUMA_NODE --membind=$ZIP_NUMA_NODE"
         log_info "  NUMA 亲和: 绑定到 node $ZIP_NUMA_NODE (ZIP 设备所在 node)"
     fi
 
-    # 确保 cgroup 任务在组内
     echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
 
     # 写入测试头信息
@@ -761,16 +641,13 @@ run_memtest() {
         echo ""
     } > "$outfile"
 
-    # 写入采样 CSV 头
     echo "timestamp,memory_current,swap_current,zswap_stored_pages,zswap_pool_total_size,cpu_user,cpu_system,cpu_idle,cpu_total" > "$phasefile"
 
     # 采集 zswap 测试前快照
     collect_zswap_stats "$algo" "$threads" "pre"
 
-    # 记录启动时间
     local start_ts=$(date +%s)
 
-    # 启动内存压力测试 (独立 Python 脚本, 避免内联引号问题)
     $numa_prefix python3 "$RESULT_DIR/_memtest_runner.py" \
         "$per_thread_bytes" "$threads" "$TEST_DURATION" "$phasefile" "$CGROUP_DIR" "$DATA_SOURCE" \
         2>&1 | tee -a "$outfile"
@@ -781,7 +658,6 @@ run_memtest() {
     # 采集 zswap 测试后快照
     collect_zswap_stats "$algo" "$threads" "post"
 
-    # 提取关键指标写入测试日志
     {
         echo ""
         echo "=== Test Summary ==="
@@ -793,326 +669,10 @@ run_memtest() {
     log_info "内存压力测试完成: algo=$algo, threads=$threads, 耗时=${elapsed}s"
 }
 
-# ========== llama.cpp 基准测试 (多进程内存压力) ==========
-#
-# 设计思路:
-#   启动 N 个并发 llama-bench 进程，每个进程独立加载模型到内存。
-#   通过进程数控制总内存占用: N × model_size
-#   随进程数增长自然经历三阶段: 无 swap → zswap 压缩 → swap 满载
-#
-# 示例 (model ~5GB, cgroup high=16G, swap=16G):
-#   1 进程  →  5GB  < 16G   → 无 swap
-#   3 进程  → 15GB  ≈ 16G   → 接近触发 zswap
-#   4 进程  → 20GB  > 16G   → zswap 压缩 + swap 写入
-#   7 进程  → 35GB  > 32G   → swap 满载
-#
-run_llama_bench() {
-    local algo=$1
-    local threads=$2
-    local outfile="$RESULT_DIR/bench_${algo}_t${threads}.log"
-    local phasefile="$RESULT_DIR/phase_llama_${algo}_t${threads}.log"
-
-    # LLAMA_ENABLED=0 时直接跳过，不打印任何信息
-    if [ $LLAMA_ENABLED -eq 0 ]; then
-        return
-    fi
-
-    if [ $LLAMA_BENCH_AVAILABLE -eq 0 ]; then
-        log_info "  llama-bench 未安装，跳过"
-        return
-    fi
-
-    if [ ! -f "$MODEL" ]; then
-        log_info "  模型文件不存在，跳过 llama-bench: $MODEL"
-        return
-    fi
-
-    # ---- 计算并发实例数 ----
-    # 原则: 总内存占用 (N × model_size + KV cache + overhead) <= cgroup_high + swap
-    # 不能简单用 target_mem / model_size，因为没算 KV cache 等运行时开销
-    local model_size_bytes
-    model_size_bytes=$(stat -c %s "$MODEL" 2>/dev/null || echo "0")
-    local model_size_mb=$((model_size_bytes / 1024 / 1024))
-
-    if [ "$model_size_bytes" -eq 0 ]; then
-        log_warn "  无法获取模型文件大小，使用 1 个实例"
-        model_size_mb=1024  # 保守估计 1GB
-    fi
-
-    # KV cache + 运行时开销估算 (prompt+gen 分配的中间 buffer)
-    # 大致估算: batch*n_ctx*layers*hidden*bytes_per_element / threads
-    # 粗略按模型大小的 40% 估算，留有余量
-    local kv_overhead_mb=$((model_size_mb * 40 / 100))
-    [ "$kv_overhead_mb" -lt 512 ] && kv_overhead_mb=512  # 至少留 512MB
-
-    local per_instance_mem_mb=$((model_size_mb + kv_overhead_mb))
-
-    local cgroup_high_mb
-    cgroup_high_mb=$(($(mem_to_bytes "$CGROUP_MEM_HIGH") / 1024 / 1024))
-    local swap_size_mb
-    swap_size_mb=$(($(mem_to_bytes "$SWAPFILE_SIZE") / 1024 / 1024))
-    local total_capacity_mb=$((cgroup_high_mb + swap_size_mb))
-
-    # 安全上限: 总容量留 2GB 余量给系统，避免恰好满触发 OOM
-    local safe_capacity_mb=$((total_capacity_mb - 2048))
-
-    # 满足目标压力所需的最小实例数 (原逻辑)
-    local per_thread_bytes
-    per_thread_bytes=$(mem_to_bytes "$PER_THREAD_MEM")
-    local total_target_mb=$((per_thread_bytes * threads / 1024 / 1024))
-    local num_instances_by_target=1
-    if [ "$model_size_mb" -gt 0 ]; then
-        num_instances_by_target=$(( (total_target_mb + model_size_mb - 1) / model_size_mb ))
-    fi
-
-    # 安全上限: 不能超过 cgroup 容量能容纳的实例数
-    local num_instances_by_capacity=1
-    if [ "$per_instance_mem_mb" -gt 0 ]; then
-        num_instances_by_capacity=$(( safe_capacity_mb / per_instance_mem_mb ))
-    fi
-    [ "$num_instances_by_capacity" -lt 1 ] && num_instances_by_capacity=1
-
-    # 取两者较小值，确保不超过 cgroup 容量
-    local num_instances=$num_instances_by_target
-    if [ "$num_instances_by_capacity" -lt "$num_instances" ]; then
-        log_warn "  目标需要 $num_instances 实例(${total_target_mb}MB)，"
-        log_warn "  但 cgroup 容量 ${safe_capacity_mb}MB 最多支持 $num_instances_by_capacity 实例"
-        num_instances=$num_instances_by_capacity
-    fi
-    [ "$num_instances" -lt 1 ] && num_instances=1
-    [ "$num_instances" -gt 32 ] && num_instances=32
-
-    # 每个实例分配的线程数 (均匀分配)
-    local threads_per_instance=$((threads / num_instances))
-    [ "$threads_per_instance" -lt 1 ] && threads_per_instance=1
-
-    local total_model_mem_mb=$((num_instances * model_size_mb))
-    local total_with_overhead_mb=$((num_instances * per_instance_mem_mb))
-
-    # 判断预期阶段 (基于实际开销估算)
-    local expected_phase="无 swap"
-    if [ "$total_with_overhead_mb" -ge "$cgroup_high_mb" ]; then
-        expected_phase="zswap 压缩"
-    fi
-    if [ "$total_with_overhead_mb" -ge "$total_capacity_mb" ]; then
-        expected_phase="swap 满载"
-    fi
-
-    log_info "运行 llama-bench (多进程): algo=$algo, threads=$threads"
-    log_info "  并发实例: $num_instances, 每实例线程: $threads_per_instance"
-    log_info "  模型大小: ${model_size_mb}MB, KV+overhead: ${kv_overhead_mb}MB/实例"
-    log_info "  估算总内存: ${total_with_overhead_mb}MB (容量: ${safe_capacity_mb}MB)"
-    log_info "  预期阶段: $expected_phase"
-
-    # ---- 确保当前 shell 在 cgroup 中 ----
-    echo $$ > "$CGROUP_DIR/cgroup.procs" 2>/dev/null || true
-
-    # ---- 写入测试头 ----
-    {
-        echo "=== Llama Benchmark (Multi-Instance Memory Pressure) ==="
-        echo "Algorithm: $algo"
-        echo "Threads: $threads"
-        echo "Concurrent_Instances: $num_instances"
-        echo "Threads_Per_Instance: $threads_per_instance"
-        echo "Model: $MODEL"
-        echo "Model_Size_MB: $model_size_mb"
-        echo "KV_Overhead_MB: $kv_overhead_mb"
-        echo "Total_Mem_Estimate_MB: $total_with_overhead_mb"
-        echo "Safe_Capacity_MB: $safe_capacity_mb"
-        echo "Cgroup_High_MB: $cgroup_high_mb"
-        echo "Swap_Size_MB: $swap_size_mb"
-        echo "Expected_Phase: $expected_phase"
-        echo "Prompt_Len: $PROMPT_LEN"
-        echo "Gen_Len: $GEN_LEN"
-        echo "Iterations: $ITERATIONS"
-        echo "Timestamp: $(date)"
-        echo ""
-    } > "$outfile"
-
-    # ---- 采样 CSV 头 ----
-    echo "timestamp,memory_current,swap_current,running_instances" > "$phasefile"
-
-    # ---- cgroup CPU 计数 (前) ----
-    local cpu_user_before=0 cpu_sys_before=0
-    if [ -f "$CGROUP_DIR/cpu.stat" ]; then
-        cpu_user_before=$(grep "^user_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
-        cpu_sys_before=$(grep "^system_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
-    fi
-
-    # ---- Phase 1: 预加载模型文件制造内存压力 ----
-    # llama-bench mmap 加载模型时只会 page-in 推理访问的部分
-    # 所以先启动 N 个 mmap+read 进程强制全量读入模型文件
-    # 这些 "填充进程" 占住内存, 让 llama-bench 在压力下运行
-    log_info "  Phase 1: 预加载 $num_instances 份模型文件到内存..."
-    local preloader_pids=()
-    for i in $(seq 1 "$num_instances"); do
-        # 使用 read() 读入私有内存 (避免 mmap MAP_SHARED 共享 page cache)
-        # 每个进程持有 file_content 字节数组不释放, 占据独立 RAM
-        python3 -c "
-import os, sys
-file_path = '$MODEL'
-file_size = os.path.getsize(file_path)
-buf = bytearray(file_size)
-with open(file_path, 'rb') as f:
-    total = 0
-    while total < file_size:
-        n = f.readinto(buf[total:])
-        if not n:
-            break
-        total += n
-sys.stdin.read()
-" &
-        preloader_pids+=($!)
-    done
-
-    # 等待预加载完成 (检测 memory.current 是否接近预期)
-    local preload_wait=0
-    local preload_target=$((model_size_mb * num_instances * 90 / 100))  # 90% of target
-    while [ "$preload_wait" -lt 120 ]; do
-        local mem_now=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null || echo "0")
-        local mem_now_mb=$((mem_now / 1024 / 1024))
-        if [ "$mem_now_mb" -ge "$preload_target" ] 2>/dev/null; then
-            log_info "  预加载完成: memory=${mem_now_mb}MB (目标 ${preload_target}MB)"
-            break
-        fi
-        if [ $((preload_wait % 10)) -eq 0 ]; then
-            log_info "  预加载中... [${preload_wait}s] memory=${mem_now_mb}MB"
-        fi
-        sleep 2
-        preload_wait=$((preload_wait + 2))
-    done
-
-    # 采样: 预加载后的内存状态
-    {
-        local mem_now=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null || echo "0")
-        local swap_now=$(cat "$CGROUP_DIR/memory.swap.current" 2>/dev/null || echo "0")
-        local ts=$(date +%s)
-        echo "$ts,$mem_now,$swap_now,$num_instances" >> "$phasefile"
-        local mem_mb=$((mem_now / 1024 / 1024))
-        local swap_mb=$((swap_now / 1024 / 1024))
-        log_info "  [预加载完成] memory=${mem_mb}MB, swap=${swap_mb}MB"
-    }
-
-    # ---- Phase 2: 在内存压力下启动 llama-bench 推理 ----
-    log_info "  Phase 2: 启动 llama-bench 推理 (压力环境下)..."
-    local pids=()
-    local inst_outfiles=()
-    for i in $(seq 1 "$num_instances"); do
-        local inst_out="$RESULT_DIR/_llama_inst${i}.log"
-        inst_outfiles+=("$inst_out")
-        llama-bench \
-            -m "$MODEL" \
-            -p "$PROMPT_LEN" \
-            -n "$GEN_LEN" \
-            -t "$threads_per_instance" \
-            -r "$ITERATIONS" \
-            -ngl 0 \
-            -mmp 0 \
-            > "$inst_out" 2>&1 &
-        pids+=($!)
-    done
-
-    log_info "  已启动 $num_instances 个实例: PIDs ${pids[*]}"
-
-    # ---- 监控 memory/swap 直到所有实例完成 ----
-    local max_wait=600
-    local waited=0
-
-    while [ "$waited" -lt "$max_wait" ]; do
-        local running=0
-        for pid in "${pids[@]}"; do
-            if kill -0 "$pid" 2>/dev/null; then
-                running=$((running + 1))
-            fi
-        done
-
-        local mem_now swap_now ts
-        mem_now=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null || echo "0")
-        swap_now=$(cat "$CGROUP_DIR/memory.swap.current" 2>/dev/null || echo "0")
-        ts=$(date +%s)
-        echo "$ts,$mem_now,$swap_now,$running" >> "$phasefile"
-
-        # 每 10 秒打印一次进度
-        if [ $((waited % 10)) -eq 0 ]; then
-            local mem_mb=$((mem_now / 1024 / 1024))
-            local swap_mb=$((swap_now / 1024 / 1024))
-            log_info "  [${waited}s] memory=${mem_mb}MB, swap=${swap_mb}MB, running=${running}/${num_instances}"
-        fi
-
-        if [ "$running" -eq 0 ]; then
-            break
-        fi
-
-        sleep 1
-        waited=$((waited + 1))
-    done
-
-    # ---- 等待残留 llama-bench 实例 ----
-    for pid in "${pids[@]}"; do
-        wait "$pid" 2>/dev/null || true
-    done
-
-    # ---- cgroup CPU 计数 (后) ----
-    local cpu_user_after=0 cpu_sys_after=0
-    if [ -f "$CGROUP_DIR/cpu.stat" ]; then
-        cpu_user_after=$(grep "^user_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
-        cpu_sys_after=$(grep "^system_usec" "$CGROUP_DIR/cpu.stat" 2>/dev/null | awk '{print $2}')
-    fi
-    local llama_user_ms=$(( (cpu_user_after - cpu_user_before) / 1000 ))
-    local llama_sys_ms=$(( (cpu_sys_after - cpu_sys_before) / 1000 ))
-
-    # ---- Phase 3: 清理预加载进程, 释放内存 ----
-    for pid in "${preloader_pids[@]}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    for pid in "${preloader_pids[@]}"; do
-        wait "$pid" 2>/dev/null || true
-    done
-    log_info "  预加载进程已清理"
-
-    # ---- 汇总各实例结果 ----
-    {
-        echo ""
-        echo "=== Aggregated Results ==="
-        echo "Concurrent_Instances: $num_instances"
-        echo "Total_Mem_Estimate_MB: $total_with_overhead_mb"
-        echo "llama_user_ms: $llama_user_ms"
-        echo "llama_sys_ms: $llama_sys_ms"
-        echo ""
-        echo "=== Per-Instance Output ==="
-        local success_count=0
-        for i in $(seq 1 "$num_instances"); do
-            local f="${inst_outfiles[$((i-1))]}"
-            if [ -f "$f" ]; then
-                echo "--- Instance $i (PID ${pids[$((i-1))]}) ---"
-                cat "$f"
-                echo ""
-                # llama-bench markdown 格式数据行以 "|" 开头，包含 t/s 数值
-                # 也匹配 "t/s" 或数字+± 模式表示成功输出
-                if grep -qE '^\|.+\|.+±' "$f" 2>/dev/null; then
-                    success_count=$((success_count + 1))
-                fi
-            else
-                echo "--- Instance $i: output file missing ---"
-            fi
-        done
-        echo ""
-        echo "Successful_Instances: $success_count / $num_instances"
-    } >> "$outfile"
-
-    # 清理临时文件
-    for f in "${inst_outfiles[@]}"; do
-        rm -f "$f" 2>/dev/null
-    done
-
-    log_info "  llama-bench 完成: user=${llama_user_ms}ms, sys=${llama_sys_ms}ms, 成功=${success_count:-?}/${num_instances}"
-}
-
 # ========== 主测试循环 ==========
 run_tests() {
     log_info "开始测试循环..."
     log_info "结果目录: $RESULT_DIR"
-    log_info "测试模式: $TEST_MODE"
 
     for algo in $ALGOS; do
         log_info "========== 测试算法: $algo =========="
@@ -1120,23 +680,7 @@ run_tests() {
 
         for t in $THREADS; do
             log_info "---------- 线程数: $t ----------"
-
-            # 根据模式运行测试
-            case "$TEST_MODE" in
-                memtest|all)
-                    run_memtest "$algo" "$t"
-                    ;;
-                llama)
-                    # llama 模式下跳过 memtest，但记录 zswap 快照
-                    collect_zswap_stats "$algo" "$t" "pre"
-                    collect_zswap_stats "$algo" "$t" "post"
-                    ;;
-            esac
-
-            # 仅在 memtest 或 all 模式下运行 llama-bench
-            if [ "$TEST_MODE" = "llama" ] || { [ "$TEST_MODE" = "all" ] && [ $LLAMA_BENCH_AVAILABLE -eq 1 ]; }; then
-                run_llama_bench "$algo" "$t"
-            fi
+            run_memtest "$algo" "$t"
 
             # 清空 zswap pool 为下一组测试准备
             if [ -w /sys/kernel/debug/zswap/flush_pool ]; then
@@ -1153,7 +697,7 @@ generate_summary() {
 
     {
         echo "============================================"
-        echo "  Zswap Performance Benchmark Summary"
+        echo "  Zswap Memtest Benchmark Summary"
         echo "============================================"
         echo ""
         echo "Test Date:    $(date)"
@@ -1239,7 +783,6 @@ generate_summary() {
 
             # 从 phase file 提取峰值指标
             if [ -f "$phasefile" ]; then
-                # 跳过 CSV 头, 取最后一行作为稳态值
                 local last_line=$(tail -1 "$phasefile" 2>/dev/null)
                 if [ -n "$last_line" ]; then
                     local peak_mem=$(echo "$last_line" | cut -d, -f2)
@@ -1258,7 +801,6 @@ generate_summary() {
                     echo "    Peak memory.current: ${peak_mem_mb}MB" >> "$summary_file"
                     echo "    Peak swap.current:   ${peak_swap_mb}MB" >> "$summary_file"
 
-                    # 压缩比 = stored_pages * 4096 / pool_total_size
                     if [ -n "$peak_stored" ] && [ "$peak_stored" -gt 0 ] 2>/dev/null \
                        && [ -n "$peak_pool_size" ] && [ "$peak_pool_size" -gt 0 ] 2>/dev/null; then
                         local orig_bytes=$((peak_stored * 4096))
@@ -1266,29 +808,6 @@ generate_summary() {
                         echo "    Compression Ratio:   ${ratio}x" >> "$summary_file"
                     fi
                 fi
-            fi
-
-            # ---- llama-bench 多进程指标 ----
-            local bench_file="$RESULT_DIR/bench_${algo}_t${t}.log"
-            if [ -f "$bench_file" ]; then
-                local bench_instances=$(grep "^Concurrent_Instances:" "$bench_file" 2>/dev/null | awk '{print $2}')
-                local bench_total_mem=$(grep "^Total_Mem_Estimate_MB:" "$bench_file" 2>/dev/null | awk '{print $2}')
-                local bench_success=$(grep "^Successful_Instances:" "$bench_file" 2>/dev/null | awk '{print $2}')
-                local bench_user=$(grep "^llama_user_ms:" "$bench_file" 2>/dev/null | awk '{print $2}')
-                local bench_sys=$(grep "^llama_sys_ms:" "$bench_file" 2>/dev/null | awk '{print $2}')
-
-                echo "    [llama-bench]" >> "$summary_file"
-                [ -n "$bench_instances" ] && echo "      Instances:         ${bench_instances}" >> "$summary_file"
-                [ -n "$bench_total_mem" ] && echo "      Total Model Mem:   ${bench_total_mem} MB" >> "$summary_file"
-                [ -n "$bench_success" ] && echo "      Successful:        ${bench_success}" >> "$summary_file"
-                [ -n "$bench_user" ] && echo "      User CPU:          ${bench_user} ms" >> "$summary_file"
-                [ -n "$bench_sys" ] && echo "      Sys CPU:           ${bench_sys} ms" >> "$summary_file"
-
-                # 提取各实例的 eval tokens/s (llama-bench 输出的最后一列通常包含速率)
-                local inst_tokens=""
-                inst_tokens=$(grep -A 100 "Per-Instance Output" "$bench_file" 2>/dev/null | \
-                    grep -oP '[\d.]+(?=\s*tokens\s*/\s*sec|\s*t/s)' | head -1)
-                [ -n "$inst_tokens" ] && echo "      Eval Rate:         ${inst_tokens} tokens/s (per instance)" >> "$summary_file"
             fi
 
             # 提取 zswap 前后差异
@@ -1319,16 +838,13 @@ generate_summary() {
 cleanup() {
     log_info "清理测试环境..."
 
-    # 禁用 zswap
     echo 0 > /sys/module/zswap/parameters/enabled 2>/dev/null || true
 
-    # 将进程移回根 cgroup 后删除
     if [ -n "$CGROUP_DIR" ] && [ -d "$CGROUP_DIR" ]; then
         echo $$ > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
         rmdir "$CGROUP_DIR" 2>/dev/null || true
     fi
 
-    # 清理 swapfile
     if [ -f "$SWAPFILE" ]; then
         swapoff "$SWAPFILE" 2>/dev/null || true
         rm -f "$SWAPFILE" 2>/dev/null || true
@@ -1340,24 +856,19 @@ cleanup() {
 
 # ========== 主函数 ==========
 main() {
-    # 解析命令行参数
-    parse_args "$@"
-
-    log_info "Zswap Performance Benchmark Started"
+    log_info "Zswap Memtest Benchmark Started"
     log_info "==================================="
-    log_info "测试模式: $TEST_MODE"
 
     # 创建结果目录
     mkdir -p "$RESULT_DIR"
 
     # 记录测试配置到结果目录
     {
-        echo "Test Mode: $TEST_MODE"
+        echo "Test Type: memtest"
         echo "Date: $(date)"
         echo "THREADS=$THREADS"
         echo "ALGOS=$ALGOS"
         echo "TEST_DURATION=$TEST_DURATION"
-        echo "LLAMA_ENABLED=$LLAMA_ENABLED"
     } > "$RESULT_DIR/test_config.txt"
 
     # 生成内存测试 Python 脚本

@@ -49,9 +49,11 @@ Linux kernel zswap 压缩算法性能对比测试工具，对比 **lz4 / deflate
 ```
 zswap-benchmark/
 ├── scripts/
-│   ├── zswap_benchmark.sh      # 主测试脚本
-│   ├── analyze_results.py       # Python 分析脚本
-│   └── setup_env.sh            # 环境初始化（适配 openEuler）
+│   ├── zswap_benchmark.sh          # 主测试脚本 (支持 --mode 参数)
+│   ├── zswap_memtest_benchmark.sh  # 内存压力测试专用脚本
+│   ├── zswap_llama_benchmark.sh    # llama-bench 推理测试专用脚本
+│   ├── analyze_results.py          # Python 分析脚本
+│   └── setup_env.sh                # 环境初始化（适配 openEuler）
 ├── docs/
 │   └── environment_a_guide.md  # 环境A操作指导
 ├── results/                    # 测试结果输出目录
@@ -145,10 +147,32 @@ scp qwen2.5-7b-q4_0.gguf root@<服务器IP>:/tmp/llama.cpp/models/7b-q4_0.gguf
 
 ### 4. 运行测试
 
+支持三种测试模式，可以灵活选择：
+
+#### 方式一：使用主脚本（推荐）
+
 ```bash
 cd zswap-benchmark/scripts
-chmod +x zswap_benchmark.sh
+chmod +x zswap_benchmark.sh zswap_memtest_benchmark.sh zswap_llama_benchmark.sh
+
+# 运行所有测试 (memtest + llama-bench)
 sudo ./zswap_benchmark.sh
+
+# 仅运行内存压力测试
+sudo ./zswap_benchmark.sh --mode=memtest
+
+# 仅运行 llama-bench 测试
+sudo ./zswap_benchmark.sh --mode=llama
+```
+
+#### 方式二：使用独立脚本
+
+```bash
+# 仅运行内存压力测试
+sudo ./zswap_memtest_benchmark.sh
+
+# 仅运行 llama-bench 测试
+sudo ./zswap_llama_benchmark.sh
 ```
 
 测试流程（每组 algo x threads）：
@@ -205,9 +229,11 @@ python3 analyze_results.py ../results/results_*/
 | 文件 | 格式 | 内容 |
 |------|------|------|
 | `phase_algo_tN.log` | CSV | 逐秒采样：timestamp, memory_current, swap_current, zswap_pages, cpu_user/system/idle |
+| `phase_llama_algo_tN.log` | CSV | llama-bench 逐秒采样（可选） |
 | `zswap_algo_tN_pre/post.log` | 文本 | 测试前/后 zswap 快照 |
-| `memtest_algo_tN.log` | 文本 | 测试日志（元数据 + METRICS 吞吐量/CPU 指标 + 进度） |
+| `memtest_algo_tN.log` | 文本 | memtest 测试日志（元数据 + METRICS） |
 | `bench_algo_tN.log` | 文本 | llama-bench 输出（可选） |
+| `test_config.txt` | 文本 | 测试配置信息 |
 | `summary.txt` | 文本 | 汇总报告 |
 
 ### 分析图表
