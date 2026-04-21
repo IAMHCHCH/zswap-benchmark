@@ -28,6 +28,9 @@ TEST_DURATION=30                     # 每组测试持续时间 (秒)
 SAMPLE_INTERVAL=1                    # 采样间隔 (秒)
 LLAMA_ENABLED=1                      # 是否启用 llama-bench 测试 (0=跳过, 1=启用)
 MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"   # 测试模型路径 (需下载 GGUF 模型, 留空则跳过)
+# Silesia 数据集配置 (用于真实数据填充测试)
+SILESIA_DIR="/tmp/silesia"           # silesia 数据集解压目录
+SILESIA_URL="https://sun.aei.polsl.pl//~sdeor/corpus/silesia.zip"  # 下载地址
 DATA_SOURCE=""                                 # 内存填充数据源 (留空=固定模式0xAA, 指定文件路径如 silesia.tar 则循环填充真实数据)
 PROMPT_LEN=512                       # llama-bench prompt 长度
 GEN_LEN=64                           # llama-bench 生成长度 (降低加快推理)
@@ -149,6 +152,77 @@ check_dependencies() {
     else
         log_info "未配置模型文件, 使用内存压力测试"
         LLAMA_BENCH_AVAILABLE=0
+    fi
+}
+
+# ========== Silesia 数据集下载与准备 ==========
+prepare_silesia() {
+    # 检查是否需要下载 silesia
+    if [ -n "$DATA_SOURCE" ] && [ -f "$DATA_SOURCE" ]; then
+        log_info "已配置数据源: $DATA_SOURCE"
+        return 0
+    fi
+
+    if [ -n "$DATA_SOURCE" ] && [ -d "$DATA_SOURCE" ]; then
+        log_info "已配置数据源目录: $DATA_SOURCE"
+        return 0
+    fi
+
+    # 检查 silesia 目录是否存在且有内容
+    if [ -d "$SILESIA_DIR" ] && [ "$(ls -A "$SILESIA_DIR" 2>/dev/null)" ]; then
+        log_info "Silesia 数据集已存在: $SILESIA_DIR"
+        DATA_SOURCE="$SILESIA_DIR"
+        return 0
+    fi
+
+    log_info "准备下载 Silesia 数据集..."
+    log_info "下载地址: $SILESIA_URL"
+
+    # 创建临时目录
+    local temp_dir="/tmp/silesia_download_$$"
+    mkdir -p "$temp_dir"
+    cd "$temp_dir"
+
+    # 下载
+    if command -v wget &> /dev/null; then
+        wget -q --show-progress "$SILESIA_URL" -O silesia.zip || curl -L -o silesia.zip "$SILESIA_URL"
+    else
+        curl -L -o silesia.zip "$SILESIA_URL"
+    fi
+
+    if [ ! -f "silesia.zip" ]; then
+        log_err "Silesia 下载失败"
+        cd /tmp
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    log_info "下载完成，解压中..."
+
+    # 解压到指定目录
+    rm -rf "$SILESIA_DIR"
+    mkdir -p "$SILESIA_DIR"
+
+    if command -v unzip &> /dev/null; then
+        unzip -q silesia.zip -d "$SILESIA_DIR"
+    else
+        # 使用 python 解压
+        python3 -c "import zipfile; zipfile.ZipFile('silesia.zip').extractall('$SILESIA_DIR')"
+    fi
+
+    # 清理临时文件
+    cd /tmp
+    rm -rf "$temp_dir"
+
+    # 验证
+    local file_count=$(ls -A "$SILESIA_DIR" 2>/dev/null | wc -l)
+    if [ "$file_count" -gt 0 ]; then
+        log_info "Silesia 数据集准备完成: $SILESIA_DIR ($file_count 个文件)"
+        DATA_SOURCE="$SILESIA_DIR"
+        return 0
+    else
+        log_err "Silesia 数据集解压失败"
+        return 1
     fi
 }
 
@@ -428,12 +502,29 @@ def main():
 
     # Pre-load data source for real-data filling
     fill_data = None
-    if data_source and os.path.isfile(data_source):
-        with open(data_source, 'rb') as f:
-            fill_data = f.read()
-        print(f'  数据源: {data_source} ({len(fill_data)} bytes)', flush=True)
-    elif data_source:
-        print(f'  [WARN] 数据源不存在, 使用固定模式: {data_source}', flush=True)
+    if data_source:
+        if os.path.isfile(data_source):
+            # 单文件数据源
+            with open(data_source, 'rb') as f:
+                fill_data = f.read()
+            print(f'  数据源: {data_source} ({len(fill_data)} bytes)', flush=True)
+        elif os.path.isdir(data_source):
+            # 目录数据源 (如 silesia)
+            import glob
+            files = sorted(glob.glob(os.path.join(data_source, '*')))
+            if files:
+                fill_data = b''
+                for f in files:
+                    try:
+                        with open(f, 'rb') as fp:
+                            fill_data += fp.read()
+                    except Exception:
+                        pass
+                print(f'  数据源目录: {data_source} ({len(files)} 个文件, {len(fill_data)} bytes)', flush=True)
+            else:
+                print(f'  [WARN] 数据源目录为空: {data_source}', flush=True)
+        else:
+            print(f'  [WARN] 数据源不存在: {data_source}', flush=True)
 
     # ============================================================
     # Phase 1: Fork children, allocate memory, measure throughput
@@ -1377,6 +1468,11 @@ main() {
 
     # 注册清理函数
     trap cleanup EXIT
+
+    # 准备 silesia 数据集（如需要）
+    if [ -z "$DATA_SOURCE" ]; then
+        prepare_silesia || true
+    fi
 
     # 运行测试
     run_tests
