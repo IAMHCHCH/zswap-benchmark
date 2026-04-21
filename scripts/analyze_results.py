@@ -145,21 +145,27 @@ class TestResult:
         self.llama_successful_instances: Optional[int] = None
         # llama 各实例 eval tokens/s
         self.llama_eval_rates: List[float] = []
+        # llama 总吞吐量 (tokens/s)
+        self.llama_total_throughput_val: Optional[float] = None
         # llama 内存压力峰值
         self.llama_peak_memory_mb: Optional[int] = None
         self.llama_peak_swap_mb: Optional[int] = None
 
     @property
     def peak_memory_mb(self) -> Optional[int]:
-        if not self.samples:
-            return None
-        return max(s.memory_mb for s in self.samples)
+        if self.samples:
+            return max(s.memory_mb for s in self.samples)
+        if self.llama_samples:
+            return max(s.memory_mb for s in self.llama_samples)
+        return None
 
     @property
     def peak_swap_mb(self) -> Optional[int]:
-        if not self.samples:
-            return None
-        return max(s.swap_mb for s in self.samples)
+        if self.samples:
+            return max(s.swap_mb for s in self.samples)
+        if self.llama_samples:
+            return max(s.swap_mb for s in self.llama_samples)
+        return None
 
     @property
     def peak_stored_pages(self) -> Optional[int]:
@@ -176,14 +182,20 @@ class TestResult:
     @property
     def compression_ratio(self) -> Optional[float]:
         """稳态压缩比 (取最后 1/3 样本的中位数)"""
-        if not self.samples:
-            return None
-        tail = self.samples[len(self.samples) // 3:]
-        ratios = [s.compression_ratio for s in tail if s.compression_ratio is not None]
-        if not ratios:
-            return None
-        ratios.sort()
-        return ratios[len(ratios) // 2]
+        if self.samples:
+            tail = self.samples[len(self.samples) // 3:]
+            ratios = [s.compression_ratio for s in tail if s.compression_ratio is not None]
+            if ratios:
+                ratios.sort()
+                return ratios[len(ratios) // 2]
+        # fallback: 从 zswap post 快照计算 (llama 测试)
+        post = self.zswap_post
+        if post:
+            stored = post.get('stored_pages', 0)
+            pool = post.get('pool_total_size', 0)
+            if stored > 0 and pool > 0:
+                return (stored * 4096) / pool
+        return None
 
     @property
     def zswap_delta_pages(self) -> Optional[int]:
@@ -388,6 +400,8 @@ class ZswapAnalyzer:
             result.llama_eval_rates = eval_rates
             # 平均 eval rate 作为 throughput
             result.throughput = sum(eval_rates) / len(eval_rates)
+            # 总吞吐量 (所有实例 tokens/s 之和)
+            result.llama_total_throughput_val = sum(eval_rates)
 
         # 从 llama phase samples 计算峰值
         if result.llama_samples:
@@ -679,7 +693,8 @@ class ZswapAnalyzer:
         ax.set_xlabel('Threads')
         ax.set_ylabel('Memory Usage (MB)')
         ax.set_title('Zswap Benchmark: Memory Pressure by Threads')
-        ax.legend(loc='upper left', fontsize=8)
+        if ax.get_legend_handles_labels()[1]:
+            ax.legend(loc='upper left', fontsize=8)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(output_dir / 'memory_pressure.png', dpi=150)
@@ -692,19 +707,28 @@ class ZswapAnalyzer:
             # 选取有 swap 使用的最高线程数测试
             best_r = None
             for r in reversed(results):
-                if r.samples and r.peak_swap_mb and r.peak_swap_mb > 0:
+                has_data = r.samples or r.llama_samples
+                if has_data and r.peak_swap_mb and r.peak_swap_mb > 0:
                     best_r = r
                     break
             if best_r is None:
-                # fallback: 取最高线程数
-                best_r = results[-1] if results else None
-            if best_r is None or not best_r.samples:
+                # fallback: 取有采样数据的最高线程数
+                for r in reversed(results):
+                    if r.samples or r.llama_samples:
+                        best_r = r
+                        break
+            if best_r is None:
+                continue
+
+            # 使用 memtest samples 或 llama_samples
+            timeline_samples = best_r.samples if best_r.samples else best_r.llama_samples
+            if not timeline_samples:
                 continue
 
             fig, ax1 = plt.subplots(figsize=(14, 8))
-            times = [s.timestamp - best_r.samples[0].timestamp for s in best_r.samples]
-            mem_vals = [s.memory_mb for s in best_r.samples]
-            swap_vals = [s.swap_mb for s in best_r.samples]
+            times = [s.timestamp - timeline_samples[0].timestamp for s in timeline_samples]
+            mem_vals = [s.memory_mb for s in timeline_samples]
+            swap_vals = [s.swap_mb for s in timeline_samples]
 
             ax1.fill_between(times, mem_vals, alpha=0.3, color='#1f77b4', label='memory.current')
             ax1.plot(times, mem_vals, color='#1f77b4', linewidth=1.5)
@@ -715,7 +739,8 @@ class ZswapAnalyzer:
             ax1.set_xlabel('Time (s)')
             ax1.set_ylabel('Memory (MB)')
             label = ALGO_LABELS.get(algo, algo)
-            ax1.set_title(f'{label} @ {best_r.threads} threads: Memory/Swap Over Time')
+            inst_info = f', {best_r.llama_instances}inst' if best_r.llama_instances else ''
+            ax1.set_title(f'{label} @ {best_r.threads} threads{inst_info}: Memory/Swap Over Time')
             ax1.legend(loc='upper left')
             ax1.grid(True, alpha=0.3)
             fig.tight_layout()
@@ -738,13 +763,14 @@ class ZswapAnalyzer:
         ax.set_xlabel('Threads')
         ax.set_ylabel('Peak Swap Usage (MB)')
         ax.set_title('Zswap Benchmark: Swap Usage by Algorithm')
-        ax.legend(loc='upper left')
+        if ax.get_legend_handles_labels()[1]:
+            ax.legend(loc='upper left')
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(output_dir / 'swap_usage.png', dpi=150)
         plt.close(fig)
 
-        # ---- 图4: Total Throughput vs Threads ----
+        # ---- 图4: Total Throughput vs Threads (memtest KB/s) ----
         has_tp = any(r.total_throughput_kbps for algo in algos for r in self.results[algo])
         if has_tp:
             fig, ax = plt.subplots(figsize=(14, 8))
@@ -759,13 +785,43 @@ class ZswapAnalyzer:
             ax.set_xlabel('Threads')
             ax.set_ylabel('Total Throughput (KB/s)')
             ax.set_title('Zswap Benchmark: Total Throughput vs Threads')
-            ax.legend(loc='upper left')
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='upper left')
             ax.grid(True, alpha=0.3)
             fig.tight_layout()
             fig.savefig(output_dir / 'throughput_vs_threads.png', dpi=150)
             plt.close(fig)
 
-        # ---- 图5: Elapsed / Sys Time vs Threads ----
+        # ---- 图4b: Total Throughput vs Threads (llama tokens/s) ----
+        has_llama_tp = any(r.llama_total_throughput_val for algo in algos for r in self.results[algo])
+        if has_llama_tp:
+            fig, ax = plt.subplots(figsize=(14, 8))
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                ts = [r.threads for r in results if r.llama_total_throughput_val]
+                vals = [r.llama_total_throughput_val for r in results if r.llama_total_throughput_val]
+                if ts:
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(ts, vals, 'o-', label=label, color=color, linewidth=2)
+                    # 标注实例数
+                    for t, v, r in zip(ts, vals,
+                                       [r for r in results if r.llama_total_throughput_val]):
+                        if r.llama_instances:
+                            ax.annotate(f'{r.llama_instances}inst',
+                                        (t, v), textcoords="offset points",
+                                        xytext=(5, 5), fontsize=7, color=color)
+            ax.set_xlabel('Threads (total)')
+            ax.set_ylabel('Total Throughput (tokens/s)')
+            ax.set_title('llama-bench: Total Inference Throughput vs Threads')
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='upper left')
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(output_dir / 'llama_throughput_vs_threads.png', dpi=150)
+            plt.close(fig)
+
+        # ---- 图5: Elapsed / Sys Time vs Threads (memtest) ----
         has_time = any(r.alloc_elapsed_sec is not None for algo in algos for r in self.results[algo])
         if has_time:
             fig, axes = plt.subplots(1, 2, figsize=(16, 7))
@@ -782,7 +838,8 @@ class ZswapAnalyzer:
             ax.set_xlabel('Threads')
             ax.set_ylabel('Alloc Elapsed Time (sec)')
             ax.set_title('Memory Allocation Time vs Threads')
-            ax.legend(loc='upper left', fontsize=8)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='upper left', fontsize=8)
             ax.grid(True, alpha=0.3)
 
             ax = axes[1]
@@ -797,14 +854,63 @@ class ZswapAnalyzer:
             ax.set_xlabel('Threads')
             ax.set_ylabel('System Time (sec)')
             ax.set_title('Kernel/Compression Time vs Threads')
-            ax.legend(loc='upper left', fontsize=8)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='upper left', fontsize=8)
             ax.grid(True, alpha=0.3)
 
             fig.tight_layout()
             fig.savefig(output_dir / 'time_vs_threads.png', dpi=150)
             plt.close(fig)
 
-        # ---- 图6: CPU Usage Breakdown: Business vs Compression ----
+        # ---- 图5b: CPU Time vs Threads (llama) ----
+        has_llama_cpu = any(r.llama_user_ms is not None for algo in algos for r in self.results[algo])
+        if has_llama_cpu:
+            fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+            ax = axes[0]
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                ts = [r.threads for r in results if r.llama_user_ms is not None]
+                vals = [r.llama_user_ms / 1000.0 for r in results if r.llama_user_ms is not None]
+                if ts:
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(ts, vals, 'o-', label=label, color=color, linewidth=2)
+                    # 标注实例数
+                    for t, v, r in zip(ts, vals,
+                                       [r for r in results if r.llama_user_ms is not None]):
+                        if r.llama_instances:
+                            ax.annotate(f'{r.llama_instances}inst',
+                                        (t, v), textcoords="offset points",
+                                        xytext=(5, 5), fontsize=7, color=color)
+            ax.set_xlabel('Threads (total)')
+            ax.set_ylabel('User CPU Time (sec)')
+            ax.set_title('llama-bench: Inference User Time vs Threads')
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='upper left', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+            ax = axes[1]
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                ts = [r.threads for r in results if r.llama_sys_ms is not None]
+                vals = [r.llama_sys_ms / 1000.0 for r in results if r.llama_sys_ms is not None]
+                if ts:
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(ts, vals, 'o-', label=label, color=color, linewidth=2)
+            ax.set_xlabel('Threads (total)')
+            ax.set_ylabel('Sys CPU Time (sec)')
+            ax.set_title('llama-bench: Kernel/Compression Time vs Threads')
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='upper left', fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+            fig.tight_layout()
+            fig.savefig(output_dir / 'llama_time_vs_threads.png', dpi=150)
+            plt.close(fig)
+
+        # ---- 图6: CPU Usage Breakdown: Business vs Compression (memtest) ----
         has_biz = any(r.business_pct is not None for algo in algos for r in self.results[algo])
         if has_biz:
             for algo in algos:
@@ -828,7 +934,8 @@ class ZswapAnalyzer:
                 ax.set_ylim(0, 105)
                 label = ALGO_LABELS.get(algo, algo)
                 ax.set_title(f'{label}: Business vs Compression CPU')
-                ax.legend(loc='upper right')
+                if ax.get_legend_handles_labels()[1]:
+                    ax.legend(loc='upper right')
                 ax.grid(True, alpha=0.3, axis='y')
                 # Add value labels
                 for i, (b, c) in enumerate(zip(biz_vals, comp_vals)):
@@ -838,6 +945,58 @@ class ZswapAnalyzer:
                 fig.tight_layout()
                 safe_algo = algo.replace('-', '_')
                 fig.savefig(output_dir / f'cpu_breakdown_{safe_algo}.png', dpi=150)
+                plt.close(fig)
+
+        # ---- 图6b: CPU Usage Breakdown (llama) ----
+        has_llama_cpu_breakdown = any(
+            r.llama_user_ms is not None and r.llama_sys_ms is not None
+            for algo in algos for r in self.results[algo]
+        )
+        if has_llama_cpu_breakdown:
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                valid = [r for r in results if r.llama_user_ms is not None and r.llama_sys_ms is not None]
+                if not valid:
+                    continue
+                ts = [r.threads for r in valid]
+                total_ms = [r.llama_user_ms + r.llama_sys_ms for r in valid]
+                user_ms = [r.llama_user_ms for r in valid]
+                sys_ms = [r.llama_sys_ms for r in valid]
+
+                # 计算百分比
+                user_pct = [u / (u + s) * 100 if (u + s) > 0 else 0 for u, s in zip(user_ms, sys_ms)]
+                sys_pct = [s / (u + s) * 100 if (u + s) > 0 else 0 for u, s in zip(user_ms, sys_ms)]
+
+                fig, ax = plt.subplots(figsize=(12, 7))
+                bar_w = 0.8
+                x_pos = range(len(ts))
+                bars_user = ax.bar(x_pos, user_pct, bar_w, label='User (inference)', color='#2196F3')
+                bars_sys = ax.bar(x_pos, sys_pct, bar_w, bottom=user_pct,
+                                  label='Kernel (zswap/IO)', color='#FF9800')
+                # 标注实例数
+                ax.set_xticks(x_pos)
+                labels = []
+                for r in valid:
+                    if r.llama_instances:
+                        labels.append(f"{r.threads}T\n({r.llama_instances}inst)")
+                    else:
+                        labels.append(str(r.threads))
+                ax.set_xticklabels(labels)
+                ax.set_xlabel('Threads')
+                ax.set_ylabel('CPU Time Distribution (%)')
+                ax.set_ylim(0, 105)
+                label = ALGO_LABELS.get(algo, algo)
+                ax.set_title(f'{label}: User vs Kernel CPU (llama-bench)')
+                if ax.get_legend_handles_labels()[1]:
+                    ax.legend(loc='upper right')
+                ax.grid(True, alpha=0.3, axis='y')
+                for i, (u, s) in enumerate(zip(user_pct, sys_pct)):
+                    ax.text(i, u / 2, f'{u:.0f}%', ha='center', va='center', fontsize=8, color='white')
+                    if s > 5:
+                        ax.text(i, u + s / 2, f'{s:.0f}%', ha='center', va='center', fontsize=8, color='white')
+                fig.tight_layout()
+                safe_algo = algo.replace('-', '_')
+                fig.savefig(output_dir / f'llama_cpu_breakdown_{safe_algo}.png', dpi=150)
                 plt.close(fig)
 
         # ---- 图7: 压缩比对比 (柱状图) ----
@@ -886,7 +1045,8 @@ class ZswapAnalyzer:
             ax.set_xlabel('Threads')
             ax.set_ylabel('Peak Memory (MB)')
             ax.set_title('Deflate: HW vs SW (Memory)')
-            ax.legend()
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend()
             ax.grid(True, alpha=0.3)
 
             # 5b: swap 使用对比
@@ -901,10 +1061,11 @@ class ZswapAnalyzer:
             ax.set_xlabel('Threads')
             ax.set_ylabel('Peak Swap (MB)')
             ax.set_title('Deflate: HW vs SW (Swap)')
-            ax.legend()
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend()
             ax.grid(True, alpha=0.3)
 
-            # 5c: 压缩比对比
+            # 5c: 压缩比对比 (支持 memtest samples 和 zswap_post 快照)
             ax = axes[2]
             for algo, label, color in [('deflate-sw', 'Deflate (sw)', ALGO_COLORS['deflate-sw']),
                                         ('deflate', 'Deflate (HW)', ALGO_COLORS['deflate'])]:
@@ -912,18 +1073,23 @@ class ZswapAnalyzer:
                 threads_list = []
                 ratio_vals = []
                 for r in results:
-                    # 取每个线程数最终采样点的压缩比
+                    # 优先从 samples 取最终采样点压缩比
                     if r.samples:
                         last = r.samples[-1]
                         if last.compression_ratio is not None and last.zswap_pool_total_size > 0:
                             threads_list.append(r.threads)
                             ratio_vals.append(last.compression_ratio)
+                    elif r.compression_ratio is not None:
+                        # fallback: 使用 compression_ratio 属性 (含 zswap_post 快照)
+                        threads_list.append(r.threads)
+                        ratio_vals.append(r.compression_ratio)
                 if threads_list:
                     ax.plot(threads_list, ratio_vals, 'o-', label=label, color=color, linewidth=2)
             ax.set_xlabel('Threads')
             ax.set_ylabel('Compression Ratio')
             ax.set_title('Deflate: HW vs SW (Compression)')
-            ax.legend()
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend()
             ax.grid(True, alpha=0.3)
 
             fig.tight_layout()
@@ -940,31 +1106,34 @@ class ZswapAnalyzer:
         if max_threads > 0:
             fig, axes = plt.subplots(2, 1, figsize=(16, 12), sharex=True)
 
-            # 上图: memory.current
+            # 上图: memory.current (支持 llama_samples)
             ax = axes[0]
             for algo in algos:
                 results = sorted(self.results[algo], key=lambda x: x.threads)
-                r = next((x for x in reversed(results) if x.threads == max_threads and x.samples), None)
+                r = next((x for x in reversed(results) if x.threads == max_threads and (x.samples or x.llama_samples)), None)
                 if r:
-                    times = [s.timestamp - r.samples[0].timestamp for s in r.samples]
-                    vals = [s.memory_mb for s in r.samples]
+                    timeline = r.samples if r.samples else r.llama_samples
+                    times = [s.timestamp - timeline[0].timestamp for s in timeline]
+                    vals = [s.memory_mb for s in timeline]
                     color = ALGO_COLORS.get(algo, 'gray')
                     label = ALGO_LABELS.get(algo, algo)
                     ax.plot(times, vals, '-', label=label, color=color, linewidth=1.5)
             ax.axhline(y=CGROUP_MEM_HIGH, color='red', linestyle=':', alpha=0.5)
             ax.set_ylabel('memory.current (MB)')
             ax.set_title(f'All Algorithms @ {max_threads} threads: Memory Over Time')
-            ax.legend(loc='lower right', fontsize=8)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='lower right', fontsize=8)
             ax.grid(True, alpha=0.3)
 
-            # 下图: swap.current
+            # 下图: swap.current (支持 llama_samples)
             ax = axes[1]
             for algo in algos:
                 results = sorted(self.results[algo], key=lambda x: x.threads)
-                r = next((x for x in reversed(results) if x.threads == max_threads and x.samples), None)
+                r = next((x for x in reversed(results) if x.threads == max_threads and (x.samples or x.llama_samples)), None)
                 if r:
-                    times = [s.timestamp - r.samples[0].timestamp for s in r.samples]
-                    vals = [s.swap_mb for s in r.samples]
+                    timeline = r.samples if r.samples else r.llama_samples
+                    times = [s.timestamp - timeline[0].timestamp for s in timeline]
+                    vals = [s.swap_mb for s in timeline]
                     color = ALGO_COLORS.get(algo, 'gray')
                     label = ALGO_LABELS.get(algo, algo)
                     ax.plot(times, vals, '-', label=label, color=color, linewidth=1.5)
@@ -972,7 +1141,8 @@ class ZswapAnalyzer:
             ax.set_xlabel('Time (s)')
             ax.set_ylabel('swap.current (MB)')
             ax.set_title(f'All Algorithms @ {max_threads} threads: Swap Over Time')
-            ax.legend(loc='lower right', fontsize=8)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='lower right', fontsize=8)
             ax.grid(True, alpha=0.3)
 
             fig.tight_layout()
@@ -1001,7 +1171,8 @@ class ZswapAnalyzer:
                        label=f'cgroup high ({CGROUP_MEM_HIGH}MB)')
             ax.set_ylabel('memory.current (MB)')
             ax.set_title('llama-bench Multi-Instance: Memory Over Time')
-            ax.legend(loc='lower right', fontsize=7)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='lower right', fontsize=7)
             ax.grid(True, alpha=0.3)
 
             ax = axes[1]
@@ -1020,7 +1191,8 @@ class ZswapAnalyzer:
             ax.set_xlabel('Time (s)')
             ax.set_ylabel('swap.current (MB)')
             ax.set_title('llama-bench Multi-Instance: Swap Over Time')
-            ax.legend(loc='lower right', fontsize=7)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='lower right', fontsize=7)
             ax.grid(True, alpha=0.3)
 
             fig.tight_layout()
@@ -1045,7 +1217,8 @@ class ZswapAnalyzer:
             ax.set_xlabel('Threads (total)')
             ax.set_ylabel('Avg Eval Rate (tokens/s per instance)')
             ax.set_title('llama-bench: Inference Throughput vs Memory Pressure')
-            ax.legend(loc='upper right')
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='upper right')
             ax.grid(True, alpha=0.3)
             fig.tight_layout()
             fig.savefig(output_dir / 'llama_eval_vs_threads.png', dpi=150)
@@ -1103,6 +1276,7 @@ class ZswapAnalyzer:
                     'llama_eval_rates': r.llama_eval_rates,
                     'llama_peak_memory_mb': r.llama_peak_memory_mb,
                     'llama_peak_swap_mb': r.llama_peak_swap_mb,
+                    'llama_total_throughput_tokens_per_sec': r.llama_total_throughput_val,
                     'throughput': r.throughput,
                     'latency': r.latency,
                     'num_samples': len(r.samples),
