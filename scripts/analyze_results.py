@@ -2,6 +2,16 @@
 """
 analyze_results.py - Zswap 性能结果分析脚本
 解析 phase_*.log (逐秒采样)、zswap pre/post 快照，生成对比报告和图表
+
+支持测试类型:
+- memtest: 内存压力测试 (memset/mmap)
+- llama: llama-bench 推理测试
+- all: 两种测试的混合结果
+
+使用方法:
+    python3 analyze_results.py <results_directory>
+    python3 analyze_results.py <results_directory> --type=memtest
+    python3 analyze_results.py <results_directory> --type=llama
 """
 
 import csv
@@ -195,9 +205,10 @@ class TestResult:
 class ZswapAnalyzer:
     """Zswap 结果分析器"""
 
-    def __init__(self, results_dir: str):
+    def __init__(self, results_dir: str, test_type: str = 'all'):
         self.results_dir = Path(results_dir)
         self.results: Dict[str, List[TestResult]] = {}
+        self.test_type = test_type  # 'memtest', 'llama', or 'all'
 
     # ---- 解析 phase_*.log (逐秒采样 CSV) ----
     def parse_phase_log(self, filepath: Path) -> Optional[TestResult]:
@@ -1107,21 +1118,33 @@ class ZswapAnalyzer:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 analyze_results.py <results_directory>")
-        print("")
-        print("Example:")
-        print("  python3 analyze_results.py ../results/results_20260414_120000/")
-        sys.exit(1)
+    import argparse
 
-    results_dir = Path(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description='Zswap 性能结果分析脚本 - 生成对比报告和图表',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+    python3 analyze_results.py ../results/results_20260414_120000/
+    python3 analyze_results.py ../results/memtest_20260414_120000/ --type=memtest
+    python3 analyze_results.py ../results/llama_20260414_120000/ --type=llama
+        """
+    )
+    parser.add_argument('results_dir', help='结果目录路径')
+    parser.add_argument('--type', '-t', choices=['memtest', 'llama', 'all'],
+                        default='all', help='测试类型 (默认: all)')
+
+    args = parser.parse_args()
+
+    results_dir = Path(args.results_dir)
     if not results_dir.exists():
         print(f"[ERROR] Directory not found: {results_dir}")
         sys.exit(1)
 
     print(f"[INFO] Analyzing: {results_dir}")
+    print(f"[INFO] Test type filter: {args.type}")
 
-    analyzer = ZswapAnalyzer(results_dir)
+    analyzer = ZswapAnalyzer(results_dir, test_type=args.type)
     analyzer.load_results()
 
     if not analyzer.results:
