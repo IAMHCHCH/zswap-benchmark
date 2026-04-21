@@ -220,7 +220,7 @@ modprobe zstd 2>/dev/null || true
 # HiSilicon ZIP 硬件加速器 (鲲鹏920, 支持 lz4/zstd 硬件加速, 不支持 lzo)
 # uacc_mode=1: 启用用户态加速框架; pf_q_num=256: 增加队列深度提升吞吐
 rmmod hisi_zip 2>/dev/null || true
-if modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null; then
+if modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1 2>/dev/null; then
     echo "  ✓ HiSilicon ZIP 硬件加速器已加载 (uacc_mode=1, pf_q_num=256)"
 
     # 打印 ZIP 设备 NUMA 拓扑

@@ -89,7 +89,7 @@ detect_hw_accelerator() {
 
     swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
-    modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
+    modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1 2>/dev/null || true
     swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
     HW_ACCEL_AVAILABLE=0
@@ -219,7 +219,7 @@ configure_zswap() {
     swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
     if [ "$display_algo" = "deflate" ]; then
-        modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
+        modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1 2>/dev/null || true
     fi
     swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 

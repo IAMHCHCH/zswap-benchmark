@@ -73,7 +73,7 @@ detect_hw_accelerator() {
     # 先 swapoff 再卸载可能残留的旧模块, 否则 hisi_zip 被 zswap 占用无法卸载
     swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
-    modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
+    modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1 2>/dev/null || true
     # 重新启用 swapfile
     swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
@@ -222,7 +222,7 @@ configure_zswap() {
     swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
     if [ "$display_algo" = "deflate" ]; then
-        modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
+        modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1 2>/dev/null || true
     fi
     swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
