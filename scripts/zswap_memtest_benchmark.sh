@@ -21,6 +21,9 @@ SWAP_PRIORITY=100                    # swap 优先级
 THREADS="8 32 64 80 128 160"         # 三阶段均衡: 无swap(8,32) + zswap(64,80) + swap满(128,160)
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 硬件deflate(hisi-deflate-acomp)
 TEST_DURATION=30                     # 每组测试持续时间 (秒)
+# Silesia 数据集配置 (用于真实数据填充测试)
+SILESIA_DIR="/tmp/silesia"           # silesia 数据集解压目录
+SILESIA_URL="https://sun.aei.polsl.pl//~sdeor/corpus/silesia.zip"  # 下载地址
 DATA_SOURCE=""                       # 内存填充数据源 (留空=固定模式0xAA, 指定文件路径则循环填充真实数据)
 
 # 结果目录 (添加 memtest 标识)
@@ -66,6 +69,77 @@ check_dependencies() {
     done
 }
 
+# ========== Silesia 数据集下载与准备 ==========
+prepare_silesia() {
+    # 检查是否需要下载 silesia
+    if [ -n "$DATA_SOURCE" ] && [ -f "$DATA_SOURCE" ]; then
+        log_info "已配置数据源: $DATA_SOURCE"
+        return 0
+    fi
+
+    if [ -n "$DATA_SOURCE" ] && [ -d "$DATA_SOURCE" ]; then
+        log_info "已配置数据源目录: $DATA_SOURCE"
+        return 0
+    fi
+
+    # 检查 silesia 目录是否存在且有内容
+    if [ -d "$SILESIA_DIR" ] && [ "$(ls -A "$SILESIA_DIR" 2>/dev/null)" ]; then
+        log_info "Silesia 数据集已存在: $SILESIA_DIR"
+        DATA_SOURCE="$SILESIA_DIR"
+        return 0
+    fi
+
+    log_info "准备下载 Silesia 数据集..."
+    log_info "下载地址: $SILESIA_URL"
+
+    # 创建临时目录
+    local temp_dir="/tmp/silesia_download_$$"
+    mkdir -p "$temp_dir"
+    cd "$temp_dir"
+
+    # 下载
+    if command -v wget &> /dev/null; then
+        wget -q --show-progress "$SILESIA_URL" -O silesia.zip || curl -L -o silesia.zip "$SILESIA_URL"
+    else
+        curl -L -o silesia.zip "$SILESIA_URL"
+    fi
+
+    if [ ! -f "silesia.zip" ]; then
+        log_err "Silesia 下载失败"
+        cd /tmp
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    log_info "下载完成，解压中..."
+
+    # 解压到指定目录
+    rm -rf "$SILESIA_DIR"
+    mkdir -p "$SILESIA_DIR"
+
+    if command -v unzip &> /dev/null; then
+        unzip -q silesia.zip -d "$SILESIA_DIR"
+    else
+        # 使用 python 解压
+        python3 -c "import zipfile; zipfile.ZipFile('silesia.zip').extractall('$SILESIA_DIR')"
+    fi
+
+    # 清理临时文件
+    cd /tmp
+    rm -rf "$temp_dir"
+
+    # 验证
+    local file_count=$(ls -A "$SILESIA_DIR" 2>/dev/null | wc -l)
+    if [ "$file_count" -gt 0 ]; then
+        log_info "Silesia 数据集准备完成: $SILESIA_DIR ($file_count 个文件)"
+        DATA_SOURCE="$SILESIA_DIR"
+        return 0
+    else
+        log_err "Silesia 数据集解压失败"
+        return 1
+    fi
+}
+
 # ========== 硬件加速器检测 ==========
 detect_hw_accelerator() {
     log_info "检测 HiSilicon ZIP 硬件加速器..."
@@ -73,7 +147,7 @@ detect_hw_accelerator() {
     # 先 swapoff 再卸载可能残留的旧模块, 否则 hisi_zip 被 zswap 占用无法卸载
     swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
-    modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
+    modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1 2>/dev/null || true
     # 重新启用 swapfile
     swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
@@ -222,7 +296,7 @@ configure_zswap() {
     swapoff -a 2>/dev/null || true
     rmmod hisi_zip 2>/dev/null || true
     if [ "$display_algo" = "deflate" ]; then
-        modprobe hisi_zip uacc_mode=1 pf_q_num=256 2>/dev/null || true
+        modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1 2>/dev/null || true
     fi
     swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
@@ -325,12 +399,30 @@ def main():
 
     # Pre-load data source for real-data filling
     fill_data = None
-    if data_source and os.path.isfile(data_source):
-        with open(data_source, 'rb') as f:
-            fill_data = f.read()
-        print(f'  数据源: {data_source} ({len(fill_data)} bytes)', flush=True)
-    elif data_source:
-        print(f'  [WARN] 数据源不存在, 使用固定模式: {data_source}', flush=True)
+    if data_source:
+        if os.path.isfile(data_source):
+            # 单文件数据源
+            with open(data_source, 'rb') as f:
+                fill_data = f.read()
+            print(f'  数据源: {data_source} ({len(fill_data)} bytes)', flush=True)
+        elif os.path.isdir(data_source):
+            # 目录数据源 (如 silesia)
+            import glob
+            files = sorted(glob.glob(os.path.join(data_source, '*')))
+            if files:
+                # 合并所有文件
+                fill_data = b''
+                for f in files:
+                    try:
+                        with open(f, 'rb') as fp:
+                            fill_data += fp.read()
+                    except Exception:
+                        pass
+                print(f'  数据源目录: {data_source} ({len(files)} 个文件, {len(fill_data)} bytes)', flush=True)
+            else:
+                print(f'  [WARN] 数据源目录为空: {data_source}', flush=True)
+        else:
+            print(f'  [WARN] 数据源不存在: {data_source}', flush=True)
 
     # ============================================================
     # Phase 1: Fork children, allocate memory, measure throughput
@@ -888,6 +980,11 @@ main() {
 
     # 注册清理函数
     trap cleanup EXIT
+
+    # 准备 silesia 数据集（如需要）
+    if [ -z "$DATA_SOURCE" ]; then
+        prepare_silesia || true  # 下载失败不影响测试，使用默认 0xAA 模式
+    fi
 
     # 运行测试
     run_tests

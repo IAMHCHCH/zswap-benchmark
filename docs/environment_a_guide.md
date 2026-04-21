@@ -457,7 +457,7 @@ sudo modprobe zstd
 lsmod | grep hisi_zip
 
 # 尝试加载
-sudo modprobe hisi_zip uacc_mode=1 pf_q_num=256
+sudo modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1
 
 # 检查设备
 ls /sys/class/uacce/hisi_zip-*
