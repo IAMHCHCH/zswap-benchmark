@@ -1199,7 +1199,7 @@ class ZswapAnalyzer:
             fig.savefig(output_dir / 'llama_memory_pressure_timeline.png', dpi=150)
             plt.close(fig)
 
-        # ---- 图11: llama-bench eval rate vs instances ----
+        # ---- 图11: llama-bench avg eval rate vs threads ----
         has_eval = any(
             r.llama_eval_rates for algo in algos for r in self.results[algo]
         )
@@ -1214,14 +1214,74 @@ class ZswapAnalyzer:
                     color = ALGO_COLORS.get(algo, 'gray')
                     label = ALGO_LABELS.get(algo, algo)
                     ax.plot(ts, rates, 'o-', label=label, color=color, linewidth=2)
+                    # 标注实例数
+                    for t, v, r in zip(ts, rates,
+                                       [x for x in results if x.llama_eval_rates]):
+                        ax.annotate(f'{r.llama_instances}inst',
+                                    (t, v), textcoords="offset points",
+                                    xytext=(5, 5), fontsize=7, color=color)
             ax.set_xlabel('Threads (total)')
             ax.set_ylabel('Avg Eval Rate (tokens/s per instance)')
-            ax.set_title('llama-bench: Inference Throughput vs Memory Pressure')
+            ax.set_title('llama-bench: Avg Inference Throughput vs Threads')
             if ax.get_legend_handles_labels()[1]:
                 ax.legend(loc='upper right')
             ax.grid(True, alpha=0.3)
             fig.tight_layout()
             fig.savefig(output_dir / 'llama_eval_vs_threads.png', dpi=150)
+            plt.close(fig)
+
+        # ---- 图11b: llama-bench token/s vs threads (每个实例独立曲线) ----
+        has_eval_instances = any(
+            len(r.llama_eval_rates) > 0 for algo in algos for r in self.results[algo]
+        )
+        if has_eval_instances:
+            fig, ax = plt.subplots(figsize=(14, 8))
+            for algo in algos:
+                results = sorted(self.results[algo], key=lambda x: x.threads)
+                # 收集所有结果中的实例数据
+                instance_data = {}
+                for r in results:
+                    if r.llama_eval_rates and r.threads:
+                        threads_key = r.threads
+                        if threads_key not in instance_data:
+                            instance_data[threads_key] = []
+                        instance_data[threads_key].append({
+                            'threads': r.threads,
+                            'instances': r.llama_instances,
+                            'rates': r.llama_eval_rates
+                        })
+
+                # 每种算法画一条平均曲线
+                threads_all = sorted(instance_data.keys())
+                avg_rates = []
+                peak_rates = []
+                inst_labels = []
+                for t in threads_all:
+                    all_rates = instance_data[t][0]['rates']
+                    avg_rates.append(sum(all_rates) / len(all_rates))
+                    peak_rates.append(max(all_rates))
+                    inst_labels.append(instance_data[t][0]['instances'])
+
+                if threads_all:
+                    color = ALGO_COLORS.get(algo, 'gray')
+                    label = ALGO_LABELS.get(algo, algo)
+                    ax.plot(threads_all, avg_rates, 'o-', label=f'{label} (avg)',
+                            color=color, linewidth=2)
+                    ax.plot(threads_all, peak_rates, '^--', label=f'{label} (max)',
+                            color=color, linewidth=1.5, alpha=0.6)
+                    for t, a, p, inst in zip(threads_all, avg_rates, peak_rates, inst_labels):
+                        ax.annotate(f'{inst}inst', (t, a),
+                                    textcoords="offset points", xytext=(5, 5),
+                                    fontsize=7, color=color)
+
+            ax.set_xlabel('Threads (total)')
+            ax.set_ylabel('Eval Rate (tokens/s)')
+            ax.set_title('llama-bench: Token/s vs Threads (avg + max per instance)')
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(loc='upper right')
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(output_dir / 'llama_tokens_per_s_vs_threads.png', dpi=150)
             plt.close(fig)
 
         print(f"[INFO] Charts saved to {output_dir}")
