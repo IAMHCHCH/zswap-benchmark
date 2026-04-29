@@ -1,0 +1,87 @@
+================================================================================
+  Zswap Performance Analysis Report
+================================================================================
+Generated:    2026-04-29 17:33:37
+Results Dir:  results/results_20260429_172326
+Algorithms:   deflate, deflate-sw, lz4, lzo, zstd
+Phase Thresholds: 无 swap < 16384MB, zswap < 32768MB, swap 满载 >= 32768MB
+
+================================================================================
+  1. 内存压力阶段总览
+================================================================================
+
+Algorithm          Threads    Total Load     Phase            Peak Mem     Peak Swap   
+--------------------------------------------------------------------------------
+Deflate (HW)       8          N/A            无 swap           2430MB       0MB         
+Deflate (HW)       32         N/A            无 swap           8625MB       0MB         
+Deflate (HW)       64         N/A            无 swap           16886MB      0MB         
+
+Deflate (sw)       8          N/A            无 swap           2430MB       0MB         
+Deflate (sw)       32         N/A            无 swap           8624MB       0MB         
+Deflate (sw)       64         N/A            无 swap           16884MB      0MB         
+
+LZ4 (sw)           8          N/A            无 swap           2417MB       0MB         
+LZ4 (sw)           32         N/A            无 swap           8613MB       0MB         
+LZ4 (sw)           64         N/A            无 swap           16877MB      0MB         
+
+LZO (sw)           8          N/A            无 swap           2431MB       0MB         
+LZO (sw)           32         N/A            无 swap           8625MB       0MB         
+LZO (sw)           64         N/A            无 swap           16885MB      0MB         
+
+ZSTD (sw)          8          N/A            无 swap           2431MB       0MB         
+ZSTD (sw)          32         N/A            无 swap           8627MB       0MB         
+ZSTD (sw)          64         N/A            无 swap           16885MB      0MB         
+
+================================================================================
+  2. 压缩比对比 (稳态)
+================================================================================
+
+Algorithm          Threads    Total Load     Phase            Ratio      Zswap Delta   
+--------------------------------------------------------------------------------
+Deflate (HW)       8          N/A            无 swap           N/A        N/A           
+Deflate (HW)       32         N/A            无 swap           N/A        N/A           
+Deflate (HW)       64         N/A            无 swap           N/A        N/A           
+
+Deflate (sw)       8          N/A            无 swap           N/A        N/A           
+Deflate (sw)       32         N/A            无 swap           N/A        N/A           
+Deflate (sw)       64         N/A            无 swap           N/A        N/A           
+
+LZ4 (sw)           8          N/A            无 swap           N/A        N/A           
+LZ4 (sw)           32         N/A            无 swap           N/A        N/A           
+LZ4 (sw)           64         N/A            无 swap           N/A        N/A           
+
+LZO (sw)           8          N/A            无 swap           N/A        N/A           
+LZO (sw)           32         N/A            无 swap           N/A        N/A           
+LZO (sw)           64         N/A            无 swap           N/A        N/A           
+
+ZSTD (sw)          8          N/A            无 swap           N/A        N/A           
+ZSTD (sw)          32         N/A            无 swap           N/A        N/A           
+ZSTD (sw)          64         N/A            无 swap           N/A        N/A           
+
+================================================================================
+  5. Zswap Pool 统计 (post-test)
+================================================================================
+
+Algorithm          Threads    Pool Size      Limit Hit    Rej(Poor)    Rej(Alloc)  
+--------------------------------------------------------------------------------
+Deflate (HW)       8          N/A            N/A          N/A          N/A         
+Deflate (HW)       32         N/A            N/A          N/A          N/A         
+Deflate (HW)       64         N/A            N/A          N/A          N/A         
+
+Deflate (sw)       8          N/A            N/A          N/A          N/A         
+Deflate (sw)       32         N/A            N/A          N/A          N/A         
+Deflate (sw)       64         N/A            N/A          N/A          N/A         
+
+LZ4 (sw)           8          N/A            N/A          N/A          N/A         
+LZ4 (sw)           32         N/A            N/A          N/A          N/A         
+LZ4 (sw)           64         N/A            N/A          N/A          N/A         
+
+LZO (sw)           8          N/A            N/A          N/A          N/A         
+LZO (sw)           32         N/A            N/A          N/A          N/A         
+LZO (sw)           64         N/A            N/A          N/A          N/A         
+
+ZSTD (sw)          8          N/A            N/A          N/A          N/A         
+ZSTD (sw)          32         N/A            N/A          N/A          N/A         
+ZSTD (sw)          64         N/A            N/A          N/A          N/A         
+
+================================================================================

@@ -1,0 +1,14 @@
+========================================
+  Zswap Benchmark Summary
+========================================
+Date: 2026年 04月 29日 星期三 17:28:08 CST
+Kernel: 7.0.0+
+Hardware: hisi-deflate-acomp 1 instances
+
+Algorithms: lz4 deflate-sw lzo zstd deflate
+Threads: 8 32 64
+Per-thread: 256M
+Cgroup high: 48G
+Swap: 16G
+
+Results: /root/hch/zswap-benchmark/results/results_20260429_172326
