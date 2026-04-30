@@ -24,15 +24,16 @@ Linux kernel zswap 压缩算法性能对比测试工具，对比 **lz4 / deflate
 | cgroup memory.high | 16G（软节流） |
 | cgroup memory.max | 24G（硬限制） |
 | swapfile | 16G（priority=100） |
-| 线程梯度 | 1, 2, 4, 8, 16, 32, 64, 128 |
+| 线程梯度 | 8, 32, 64, 80, 96, 112, 128, 144, 160 |
+| 阶段分布 | 无swap(2点) + zswap(4点) + swap满(3点) |
 
 随线程增长，内存压力自然经历三个阶段：
 
 | 线程数 | 总负载 | 阶段 | 行为 |
 |--------|--------|------|------|
-| 8, 16, 32 | 2G-8G | **无 swap** | 内存充裕，无压缩开销 |
-| 64, 72, 80, 96, 112 | 16G-28G | **zswap 压缩** | 接近/超出 cgroup high，触发压缩+swap |
-| 128, 144, 160 | 32G-40G | **swap 满载** | swap 耗尽，分配阻塞，压力最大 |
+| 8, 32 | 2G-8G | **无 swap** | 内存充裕，无压缩开销 |
+| 64, 80, 96, 112 | 16G-28G | **zswap 压缩** | 超 memory.high，触发 zswap 压缩+swap |
+| 128, 144, 160 | 32G-40G | **swap 满载** | swap 耗尽，分配阻塞/swapin，压力最大 |
 
 ### 算法对比矩阵
 
@@ -101,14 +102,16 @@ sudo ./scripts/setup_env.sh
 ```bash
 PER_THREAD_MEM="256M"                # 每线程分配内存
 CGROUP_MEM_HIGH="16G"                # cgroup 软节流阈值
-CGROUP_MEM_MAX="24G"                 # cgroup 硬限制
-SWAPFILE_SIZE="16G"                  # swap 文件大小
-SWAPFILE="/swapfile"                 # swap 文件路径
+CGROUP_MEM_MAX="max"                 # cgroup 硬限制 (max=不触发 OOM)
+SWAPFILE_SIZE="16G"                  # swap 文件大小 (与 high 匹配)
+SWAPFILE="/home/swapfile_zswap"      # swap 文件路径
 SWAP_PRIORITY=100                    # swap 优先级
-THREADS="8 16 32 64 72 80 96 112 128 144 160"  # 三阶段均衡线程梯度
+# 三阶段线程梯度: 无swap(8,32) + zswap(64,80,96,112) + swap满(128,144,160)
+THREADS="8 32 64 80 96 112 128 144 160"
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 压缩算法
 TEST_DURATION=30                     # 每组测试持续时间(秒)
-MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"  # llama-bench 模型路径
+MODEL="/root/test_zswap/llama.cpp/models/qwen2-7b-instruct-q5_0.gguf"  # llama-bench 模型
+DATA_SOURCE="/root/hch/silesia"      # memtest 使用 silesia 真实数据集
 ```
 
 > **详细操作指导**: 如果您使用的是 openEuler 或类似环境，请参考 [环境A操作指导](docs/environment_a_guide.md)，包含内核切换、cgroup v2 配置等详细步骤。
@@ -155,10 +158,10 @@ scp qwen2.5-7b-q4_0.gguf root@<服务器IP>:/tmp/llama.cpp/models/7b-q4_0.gguf
 cd zswap-benchmark/scripts
 chmod +x zswap_benchmark.sh zswap_memtest_benchmark.sh zswap_llama_benchmark.sh
 
-# 运行所有测试 (memtest + llama-bench)
+# 默认运行 llama-bench 测试 (多进程内存压力 + 推理性能)
 sudo ./zswap_benchmark.sh
 
-# 仅运行内存压力测试
+# 仅运行内存压力测试 (使用 silesia 真实数据)
 sudo ./zswap_benchmark.sh --mode=memtest
 
 # 仅运行 llama-bench 测试

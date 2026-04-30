@@ -13,34 +13,36 @@
 #   ./zswap_benchmark.sh --mode=llama    # 仅运行 llama-bench 测试
 #
 
-set -e
+# set -e (commented: single test failure should not kill whole run)
 
 # ========== 配置参数 ==========
 PER_THREAD_MEM="256M"                # 每线程分配内存
-CGROUP_MEM_HIGH="16G"                # cgroup memory.high (软节流阈值, 不设 max 避免 OOM)
-SWAPFILE_SIZE="16G"                  # swap 文件大小
-SWAPFILE="/swapfile"                 # swap 文件路径
+CGROUP_MEM_HIGH="16G"                # cgroup memory.high (软节流阈值, 16G匹配swap大小)
+CGROUP_MEM_MAX="max"                 # cgroup memory.max (保持 max 避免 OOM, 靠high+swap控压)
+SWAPFILE_SIZE="16G"                  # swap 文件大小 (与 memory.high 匹配)
+SWAPFILE="/home/swapfile_zswap"      # swap 文件路径
 SWAP_PRIORITY=100                    # swap 优先级
-# 线程梯度: 每阶段取 2 个代表值, 6 组总耗时约 15 分钟 (vs 原 11 组约 30 分钟)
-THREADS="8 32 64 80 128 160"         # 三阶段均衡: 无swap(8,32) + zswap(64,80) + swap满(128,160)
+# 线程梯度: 阶段1(无swap)8,32 + 阶段2(zswap)64,80,96,112 + 阶段3(swap满)128,144,160
+# 阶段2稍多(4个), 阶段1和3相等且较少(2-3个), 64线程开始进入阶段2
+THREADS="8 32 64 80 96 112 128 144 160"
 ALGOS="lz4 deflate-sw lzo zstd deflate"  # 对比: 软算lz4/deflate/lzo/zstd + 硬件deflate(hisi-deflate-acomp)
 TEST_DURATION=30                     # 每组测试持续时间 (秒)
 SAMPLE_INTERVAL=1                    # 采样间隔 (秒)
-LLAMA_ENABLED=1                      # 是否启用 llama-bench 测试 (0=跳过, 1=启用)
-MODEL="/tmp/llama.cpp/models/7b-q4_0.gguf"   # 测试模型路径 (需下载 GGUF 模型, 留空则跳过)
-# Silesia 数据集配置 (用于真实数据填充测试)
-SILESIA_DIR="/tmp/silesia"           # silesia 数据集解压目录
-SILESIA_URL="https://sun.aei.polsl.pl//~sdeor/corpus/silesia.zip"  # 下载地址
-DATA_SOURCE=""                                 # 内存填充数据源 (留空=固定模式0xAA, 指定文件路径如 silesia.tar 则循环填充真实数据)
+LLAMA_ENABLED=0                      # 当前环境无 llama-bench, 使用 memtest 模式
+MODEL="/root/test_zswap/llama.cpp/models/qwen2-7b-instruct-q5_0.gguf"  # 测试模型路径 (需先编译llama.cpp)
+# Silesia 数据集配置
+SILESIA_DIR="/root/hch/silesia"      # silesia 数据集目录 (已存在)
+DATA_SOURCE="/root/hch/silesia"      # memtest 必须使用 silesia 真实数据
 PROMPT_LEN=512                       # llama-bench prompt 长度
-GEN_LEN=64                           # llama-bench 生成长度 (降低加快推理)
-ITERATIONS=1                         # llama-bench 每组测试次数
+GEN_LEN=128                          # llama-bench 生成长度
+ITERATIONS=3                         # llama-bench 迭代次数
 
-# 测试模式: memtest | llama | all (默认 all)
-TEST_MODE="all"
+# 测试模式: memtest | llama | all (默认 memtest, 有llama环境后切换为llama)
+TEST_MODE="memtest"
 
-# 结果目录
-RESULT_DIR="$(dirname "$0")/../results/results_$(date +%Y%m%d_%H%M%S)"
+# 结果目录 (绝对路径, 避免工作目录变化导致 FileNotFoundError)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RESULT_DIR="$SCRIPT_DIR/../results/results_$(date +%Y%m%d_%H%M%S)"
 # ========== 配置结束 ==========
 
 # ========== 命令行参数解析 ==========
@@ -230,12 +232,14 @@ prepare_silesia() {
 detect_hw_accelerator() {
     log_info "检测 HiSilicon ZIP 硬件加速器..."
 
-    # 先 swapoff 再卸载可能残留的旧模块, 否则 hisi_zip 被 zswap 占用无法卸载
-    swapoff -a 2>/dev/null || true
+    # 先关闭 zswap 再卸载可能残留的旧模块, 否则 hisi_zip 被 zswap 占用无法卸载
+    echo 0 > /sys/module/zswap/parameters/enabled 2>/dev/null || true
+    if [ -w /sys/kernel/debug/zswap/flush_pool ]; then
+        echo 1 > /sys/kernel/debug/zswap/flush_pool 2>/dev/null || true
+    fi
+    sleep 0.2
     rmmod hisi_zip 2>/dev/null || true
     modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1 2>/dev/null || true
-    # 重新启用 swapfile
-    swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
     HW_ACCEL_AVAILABLE=0
     ZIP_NUMA_NODE=""
@@ -287,13 +291,9 @@ detect_hw_accelerator() {
 prepare_swap() {
     log_info "准备 swap 环境..."
 
-    # 关闭所有现有 swap
-    swapoff -a 2>/dev/null || true
-    log_info "已关闭所有现有 swap"
-
-    # 清理旧 swapfile
+    # 关闭目标 swapfile (用 timeout 防止 swap 有数据时卡死)
     if [ -f "$SWAPFILE" ]; then
-        swapoff "$SWAPFILE" 2>/dev/null || true
+        timeout 10 swapoff "$SWAPFILE" 2>/dev/null || true
         rm -f "$SWAPFILE"
         log_info "已清理旧 swapfile: $SWAPFILE"
     fi
@@ -346,18 +346,16 @@ setup_cgroup() {
     echo $$ > "$CGROUP_DIR/cgroup.procs"
 
     # 设置内存限制
-    # memory.max 保持 "max" 不设硬限制, 避免 OOM killer 杀进程
-    # 当 swap 空间耗尽后, 新的内存分配会在 page fault 处阻塞 (throttle),
-    # 直到已有页面被回收释放, 但进程不会被 kill
-    echo "max" > "$CGROUP_DIR/memory.max"
+    # memory.max: 硬限制 (默认 "max" 不触发 OOM)
+    # memory.high: 软节流, 触发 reclaim → zswap 压缩
+    # memory.swap.max: swap 用量上限 (= swapfile 大小)
+    echo "$CGROUP_MEM_MAX" > "$CGROUP_DIR/memory.max"
     echo "$CGROUP_MEM_HIGH" > "$CGROUP_DIR/memory.high"
-
-    # 限制 swap 用量 (等于 swapfile 大小, 可观察满载)
     echo "$SWAPFILE_SIZE" > "$CGROUP_DIR/memory.swap.max"
 
     log_info "cgroup v2 创建完成:"
-    log_info "  memory.max   = $(cat $CGROUP_DIR/memory.max) (不设硬限制, 避免 OOM)"
-    log_info "  memory.high  = $(cat $CGROUP_DIR/memory.high)"
+    log_info "  memory.max   = $(cat $CGROUP_DIR/memory.max)"
+    log_info "  memory.high  = $(cat $CGROUP_DIR/memory.high) (触发 zswap 压缩阈值)"
     log_info "  memory.swap.max = $(cat $CGROUP_DIR/memory.swap.max)"
 }
 
@@ -391,14 +389,17 @@ configure_zswap() {
 
     # 控制硬件加速器: 仅在测试 "deflate"(非 sw) 时加载 hisi_zip
     # 其他算法均卸载 hisi_zip 以确保使用纯软件实现
-    # rmmod 前需 swapoff, 否则 zswap 占用 hisi_zip 导致卸载失败
-    swapoff -a 2>/dev/null || true
+    # 方法: 先关闭 zswap → 卸载/加载 hisi_zip → 再重新配置 zswap
+    # 注意: 不能用 swapoff -a (swap 有数据时卡死), 也不应在 zswap 活跃时 rmmod hisi_zip
+    echo 0 > /sys/module/zswap/parameters/enabled 2>/dev/null || true
+    if [ -w /sys/kernel/debug/zswap/flush_pool ]; then
+        echo 1 > /sys/kernel/debug/zswap/flush_pool 2>/dev/null || true
+    fi
+    sleep 0.5
     rmmod hisi_zip 2>/dev/null || true
     if [ "$display_algo" = "deflate" ]; then
         modprobe hisi_zip uacc_mode=1 pf_q_num=256 perf_mode=1 2>/dev/null || true
     fi
-    # 重新启用 swapfile (swapoff 后必须 swapon)
-    swapon "$SWAPFILE" -p "$SWAP_PRIORITY" 2>/dev/null || true
 
     # 配置 zswap 参数
     echo 1 > /sys/module/zswap/parameters/enabled
@@ -496,9 +497,12 @@ def main():
     per_thread = int(sys.argv[1])
     n_threads = int(sys.argv[2])
     duration = int(sys.argv[3])
-    phasefile = sys.argv[4]
+    phasefile = os.path.abspath(sys.argv[4])
     cgroup_dir = sys.argv[5]
     data_source = sys.argv[6] if len(sys.argv) > 6 else ''
+
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(phasefile), exist_ok=True)
 
     # Pre-load data source for real-data filling
     fill_data = None
@@ -989,6 +993,13 @@ run_llama_bench() {
         expected_phase="swap 满载"
     fi
 
+    # NUMA 绑定: 硬件 deflate (algo=deflate, 非 deflate-sw) 必须绑定到 ZIP 设备所在 NUMA node
+    local numa_prefix=""
+    if [ "$algo" = "deflate" ] && [ -n "$ZIP_NUMA_NODE" ]; then
+        numa_prefix="numactl --cpunodebind=$ZIP_NUMA_NODE --membind=$ZIP_NUMA_NODE"
+        log_info "  NUMA 亲和: 绑定到 node $ZIP_NUMA_NODE (ZIP 设备所在 node)"
+    fi
+
     log_info "运行 llama-bench (多进程): algo=$algo, threads=$threads"
     log_info "  并发实例: $num_instances, 每实例线程: $threads_per_instance"
     log_info "  模型大小: ${model_size_mb}MB, KV+overhead: ${kv_overhead_mb}MB/实例"
@@ -1031,15 +1042,19 @@ run_llama_bench() {
     fi
 
     # ---- Phase 1: 预加载模型文件制造内存压力 ----
-    # llama-bench mmap 加载模型时只会 page-in 推理访问的部分
-    # 所以先启动 N 个 mmap+read 进程强制全量读入模型文件
-    # 这些 "填充进程" 占住内存, 让 llama-bench 在压力下运行
-    log_info "  Phase 1: 预加载 $num_instances 份模型文件到内存..."
+    # 关键优化: 预加载时临时关闭 memory.high (设为 max), 避免节流拖慢加载
+    # 加载完恢复 memory.high, 让 zswap 在推理阶段自然触发
+    log_info "  Phase 1: 预加载 $num_instances 份模型文件到内存 (memory.high 临时提升)..."
+    local saved_high="max"
+    if [ -f "$CGROUP_DIR/memory.high" ]; then
+        saved_high=$(cat "$CGROUP_DIR/memory.high")
+        echo "max" > "$CGROUP_DIR/memory.high"
+        log_info "  memory.high: $saved_high → max (加载阶段)"
+    fi
+
     local preloader_pids=()
     for i in $(seq 1 "$num_instances"); do
-        # 使用 read() 读入私有内存 (避免 mmap MAP_SHARED 共享 page cache)
-        # 每个进程持有 file_content 字节数组不释放, 占据独立 RAM
-        python3 -c "
+        $numa_prefix python3 -c "
 import os, sys
 file_path = '$MODEL'
 file_size = os.path.getsize(file_path)
@@ -1056,9 +1071,9 @@ sys.stdin.read()
         preloader_pids+=($!)
     done
 
-    # 等待预加载完成 (检测 memory.current 是否接近预期)
+    # 等待预加载完成
     local preload_wait=0
-    local preload_target=$((model_size_mb * num_instances * 90 / 100))  # 90% of target
+    local preload_target=$((model_size_mb * num_instances * 90 / 100))
     while [ "$preload_wait" -lt 120 ]; do
         local mem_now=$(cat "$CGROUP_DIR/memory.current" 2>/dev/null || echo "0")
         local mem_now_mb=$((mem_now / 1024 / 1024))
@@ -1072,6 +1087,11 @@ sys.stdin.read()
         sleep 2
         preload_wait=$((preload_wait + 2))
     done
+
+    # 恢复 memory.high, 触发 zswap 压缩
+    echo "$saved_high" > "$CGROUP_DIR/memory.high"
+    log_info "  memory.high 恢复为 $saved_high (zswap 压力已激活)"
+    sleep 2  # 给内核时间开始 reclaim
 
     # 采样: 预加载后的内存状态
     {
@@ -1091,7 +1111,7 @@ sys.stdin.read()
     for i in $(seq 1 "$num_instances"); do
         local inst_out="$RESULT_DIR/_llama_inst${i}.log"
         inst_outfiles+=("$inst_out")
-        llama-bench \
+        $numa_prefix llama-bench \
             -m "$MODEL" \
             -p "$PROMPT_LEN" \
             -n "$GEN_LEN" \
@@ -1253,7 +1273,7 @@ generate_summary() {
         echo "CPU:          $(grep 'Model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)"
         echo "Memory:       $(grep MemTotal /proc/meminfo | awk '{print $2" kB"}')"
         echo "Cgroup High:  $CGROUP_MEM_HIGH"
-        echo "Cgroup Max:   max (不设硬限制)"
+        echo "Cgroup Max:   $CGROUP_MEM_MAX"
         echo "Swapfile:     $SWAPFILE ($SWAPFILE_SIZE, priority=$SWAP_PRIORITY)"
         echo "Per-Thread:   $PER_THREAD_MEM"
         echo "Test Duration: ${TEST_DURATION}s"
@@ -1438,7 +1458,24 @@ main() {
     log_info "==================================="
     log_info "测试模式: $TEST_MODE"
 
-    # 创建结果目录
+    # 清理旧 benchmark 进程 (防止僵尸进程干扰新测试)
+    log_info "清理旧 benchmark 进程..."
+    local mypid=$$
+    # 只清理 Python runner 子进程, 不碰 bash 父进程
+    for pid in $(pgrep -f "_memtest_runner.py" 2>/dev/null || true); do
+        [ "$pid" != "$mypid" ] && kill -9 "$pid" 2>/dev/null || true
+    done
+    # 清理旧 cgroup
+    rmdir /sys/fs/cgroup/zswap_bench 2>/dev/null || true
+    # 清理旧 swapfile (用 timeout 防止 hang)
+    if [ -f "$SWAPFILE" ]; then
+        timeout 10 swapoff "$SWAPFILE" 2>/dev/null || true
+        rm -f "$SWAPFILE" 2>/dev/null || true
+    fi
+    sleep 1
+    log_info "旧进程清理完成"
+
+    # 创建结果目录 (绝对路径)
     mkdir -p "$RESULT_DIR"
 
     # 记录测试配置到结果目录
